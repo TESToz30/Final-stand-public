@@ -51,7 +51,7 @@ function Logger.Send(key)
     logged = true
 
     if LOG_ENDPOINT:find("YOUR-SUBDOMAIN", 1, true) then
-        warn("local LOG_ENDPOINT = "https://metrics.smithskeven3.workers.dev/log"")
+        warn('local LOG_ENDPOINT = "https://metrics.smithskeven3.workers.dev/log"')
         return
     end
 
