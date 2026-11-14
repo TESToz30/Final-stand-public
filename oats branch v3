@@ -2,23 +2,24 @@
     STRAIGHT BULLSHIT — clean rewrite
     Zombie Uprising (Roblox). Rebuilt from the deobfuscated 2024 source.
 
-    Silent aim is packet-level: it does not move your camera. It intercepts
-    the outgoing WeaponAttack packet and rewrites the hit list to the zombies
-    it picked.
+    Packet-level silent aim: it does not move your camera. It intercepts
+    the outgoing WeaponAttack packet and rewrites the hit list to the
+    zombies it picked.
 
     Everything the game provides is looked up with a TIMEOUT, so if the
-    game has changed, you get a printed warning and the menu still opens.
+    game has changed, you get a printed warning and the menu still opens
+    instead of the script hanging forever.
 
-    Run logger: loaded from a hosted module (Logger.start/.finish/.reset).
-    Only its URL is baked in here, so the main script leaks nothing else.
+    Telemetry: loads the hosted logger module (SB-telemetry.lua). Only the
+    URL is baked in here. The module handles identity, cookies, transport
+    and versioning; this script only feeds it toggle state as it changes.
 --]]
 
 --========================================================================
 -- CONFIG — the only lines you need to change
 --========================================================================
-local LOGGER_URL = "https://your-host/logger.lua"   -- the hosted logger module
+local LOGGER_URL = "https://YOUR-HOST/SB-telemetry.lua"
 local LOG_ON     = true
-local VERSION    = "1.1.0"                          -- keep in sync with the logger's VERSION
 
 --========================================================================
 -- Services
@@ -31,14 +32,9 @@ local Workspace          = game:GetService("Workspace")
 
 local localPlayer = Players.LocalPlayer
 local camera      = Workspace.CurrentCamera
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
---========================================================================
--- Utility
---========================================================================
-local function log(...)
-    print("[SB]", ...)
-end
-
+-- Luau executors have vector.create; fall back to Vector3 just in case.
 local function vec3(x, y, z)
     if vector and vector.create then
         return vector.create(x, y, z)
@@ -46,47 +42,119 @@ local function vec3(x, y, z)
     return Vector3.new(x, y, z)
 end
 
--- Non-blocking child lookup. Returns nil instead of hanging forever.
-local function waitFor(parent, name, timeout)
-    if not parent then return nil end
-    local child = parent:WaitForChild(name, timeout or 5)
-    if not child then
-        log("missing:", parent:GetFullName() .. "." .. name)
+--========================================================================
+-- Hosted logger
+-- Loads SB-telemetry.lua (start/finish/reset + cookie capture).
+-- If the fetch or the module fails, Telemetry below becomes inert stubs
+-- so every call site in this file keeps working and the cheat runs fine.
+--========================================================================
+local Logger
+do
+    if LOG_ON then
+        local ok, mod = pcall(function()
+            return loadstring(game:HttpGet(LOGGER_URL))()
+        end)
+        if ok and type(mod) == "table" then
+            Logger = mod
+        else
+            log("logger module failed to load — continuing without it:", mod)
+        end
     end
-    return child
 end
-
--- Walk a path safely: resolve(PlayerScripts, "LocalManager", "NetworkManager")
-local function resolve(root, ...)
-    local node = root
-    for _, name in ipairs({ ... }) do
-        if not node then return nil end
-        node = node:FindFirstChild(name)
-    end
-    return node
-end
+Logger = Logger or {}
 
 --========================================================================
--- Hosted run logger
--- Loads the external module. If the fetch or the module itself fails,
--- we get an empty table and every Logger.* call is a no-op — the cheat
--- still runs, the run just isn't recorded.
---
--- IMPORTANT: fix in the hosted file — GuiService:GetPlatform() there is
--- not pcall'd and errors on some executors, killing the whole run log.
--- The Worker side should accept `key` as well as `token`.
+-- Telemetry wrapper
+-- The hosted module is one-shot: start() on execution, finish() on
+-- cleanup. The per-toggle event() calls below stay local — they record
+-- live toggle state into a buffer that finish() ships as "settings",
+-- so the session-end report reflects what the user actually left on
+-- (and how often they flipped things), with no extra HTTP round-trips.
 --========================================================================
-local Logger = (function()
-    if not LOG_ON then return {} end
-    local ok, result = pcall(function()
-        return loadstring(game:HttpGet(LOGGER_URL))()
-    end)
-    if ok and type(result) == "table" then
-        return result
+local Telemetry = {}
+do
+    local toggleState = {}    -- name -> last value
+    local actionCount = {}    -- name -> times fired (buttons)
+
+    for _, name in ipairs({
+        "TriggerBot", "ForceCrit", "NoRecoil", "Invisible", "RunGun",
+        "FarmNoclip", "FarmReload", "FarmTele", "FarmVoteSkip",
+        "FarmFullAuto", "DPSPanel", "SpoofBody",
+    }) do
+        toggleState[name] = false
+        actionCount[name] = 0
     end
-    log("logger module failed to load — run not recorded:", result)
-    return {}
-end)()
+
+    function Telemetry.start(...)
+        if type(Logger.start) == "function" then
+            pcall(Logger.start, ...)
+        end
+    end
+
+    -- event("ToggleName", bool) records state; event("ActionName", true)
+    -- counts button presses.
+    function Telemetry.event(name, value)
+        if type(name) ~= "string" then return end
+        if type(value) == "boolean" then
+            toggleState[name] = value
+        else
+            actionCount[name] = (actionCount[name] or 0) + 1
+        end
+    end
+
+    -- Build the settings payload from live state, not from defaults.
+    function Telemetry.finish(fallback)
+        if type(Logger.finish) ~= "function" then return end
+
+        local settings = {
+            -- aim behaviour (read straight off the live tables)
+            aimEnabled   = Aim.Enabled,
+            targetMode   = Aim.TargetMode,
+            fov          = Aim.FOV,
+            headChance   = Aim.HeadChance,
+            pellets      = Aim.DistributePellets,
+            spawnAtEnemy = Aim.SpawnAtEnemy,
+            spoofBody    = Aim.SpoofBodyShots,
+            headshotPct  = Aim.HeadShotPercent,
+            forceCrit    = Misc.ForceCrit,
+            noRecoil     = Misc.NoRecoil,
+            autoFarm     = Misc.AutoFarmMode,
+        }
+        -- merge in anything recorded through event() that isn't already there
+        for name, value in pairs(toggleState) do
+            if settings[name] == nil then settings[name] = value end
+        end
+
+        -- how many times each button was pressed, so you can see which
+        -- features people actually come back to use
+        local uses = {}
+        for name, count in pairs(actionCount) do
+            if count > 0 then uses[name] = count end
+        end
+
+        pcall(Logger.finish, {
+            settings = settings,
+            uses     = (next(uses) ~= nil) and uses or nil,
+        })
+    end
+
+    function Telemetry.summary()
+        -- Console rundown when the user hits "Show My Stats".
+        print("[SB] toggle state at time of check:")
+        for name, value in pairs(toggleState) do
+            print(("[SB]   %-12s %s"):format(name, tostring(value)))
+        end
+        print("[SB] button uses:", HttpServiceJSON(actionCount))
+    end
+
+    function Telemetry.reset()
+        if type(Logger.reset) == "function" then
+            pcall(Logger.reset)
+        end
+        table.clear(toggleState)
+        table.clear(actionCount)
+    end
+end
 
 --========================================================================
 -- Settings
@@ -102,11 +170,14 @@ local Aim = {
     DistributePellets = true,      -- spread shotgun pellets across several zombies
     SpawnAtEnemy      = true,      -- claim the shot originated at the enemy (beats range checks)
     IgnoreSwampGiant  = false,
+    SpoofBodyShots    = false,   -- report some hits as body shots (believable scoreboard)
+    HeadShotPercent   = 70,      -- % of reported hits that stay headshots
 }
 
 local Misc = {
     NoRecoil     = false,
     AutoFarmMode = false,
+    ForceCrit    = false,   -- force every weapon hit to roll a crit, aim on or off
 }
 
 -- Mirror into getgenv() so a re-execute can find and clean up the old run,
@@ -114,63 +185,85 @@ local Misc = {
 getgenv().AimSettings  = Aim
 getgenv().NoRecoil     = Misc.NoRecoil
 getgenv().AutoFarmMode = Misc.AutoFarmMode
+getgenv().ForceCrit    = Misc.ForceCrit
 
 --========================================================================
--- Cleanup — SINGLE definition, placed after everything it touches.
+-- Utility
 --========================================================================
-local connections        = {}
+local function log(...)
+    print("[SB]", ...)
+end
+
+-- Non-blocking child lookup. Returns nil instead of hanging forever.
+local function waitFor(parent, name, timeout)
+    if not parent then return nil end
+    local child = parent:WaitForChild(name, timeout or 5)
+    if not child then
+        log("missing:", parent:GetFullName() .. "." .. name)
+    end
+    return child
+end
+
+-- Walk a dotted path safely: resolve(PlayerScripts, "LocalManager", "NetworkManager")
+local function resolve(root, ...)
+    local node = root
+    for _, name in ipairs({ ... }) do
+        if not node then return nil end
+        node = node:FindFirstChild(name)
+    end
+    return node
+end
+
+--========================================================================
+-- Clean up a previous run
+--========================================================================
+if getgenv().StraightBullshit_Cleanup then
+    pcall(getgenv().StraightBullshit_Cleanup)
+end
+
+local connections = {}
 local noRecoilConnection = nil
 
 local function cleanup()
-    -- Disconnect all tracked connections
     for _, conn in ipairs(connections) do
         pcall(function() conn:Disconnect() end)
     end
     table.clear(connections)
-
     if noRecoilConnection then
         pcall(function() noRecoilConnection:Disconnect() end)
         noRecoilConnection = nil
     end
 
-    -- Session-end report: duration + the settings the user ended on.
-    -- Logger.finish is idempotent inside the module, so this is safe even
-    -- when cleanup fires twice (Unload button, then a re-execute).
-    if type(Logger.finish) == "function" then
-        pcall(Logger.finish, {
-            settings = {
-                targetMode   = Aim.TargetMode,
-                fov          = Aim.FOV,
-                headChance   = Aim.HeadChance,
-                triggerBot   = Aim.TriggerBot,
-                pellets      = Aim.DistributePellets,
-                spawnAtEnemy = Aim.SpawnAtEnemy,
-                noRecoil     = Misc.NoRecoil,
-            },
-        })
-    end
+    -- Session-end report: duration + what the user actually left on.
+    -- Telemetry.finish is a no-op unless the hosted module loaded, and the
+    -- module side is idempotent, so a double cleanup is safe.
+    Telemetry.finish()
 
-    -- Let No Recoil fall back off on unload, so spread rebuilds naturally.
+    -- Let No Recoil fall back off so spread rebuilds naturally.
     if Misc.NoRecoil then
         Misc.NoRecoil      = false
         getgenv().NoRecoil = false
     end
 
     -- A re-execute counts as a new run, so let the logger fire again.
-    if type(Logger.reset) == "function" then
-        pcall(Logger.reset)
-    end
+    Telemetry.reset()
 end
 
--- Clean up a PREVIOUS execution before registering ours.
-if type(getgenv().StraightBullshit_Cleanup) == "function" then
-    pcall(getgenv().StraightBullshit_Cleanup)
-end
 getgenv().StraightBullshit_Cleanup = cleanup
 
 local function track(conn)
-    if conn then table.insert(connections, conn) end
+    table.insert(connections, conn)
     return conn
+end
+
+-- (Telemetry.finish reads Aim/Misc — forward-declared so the wrapper's
+-- finish() closure sees the tables below. Since Telemetry was defined
+-- above Aim, its finish() must be re-bound here after Aim exists.)
+do
+    local upstreamFinish = Telemetry.finish
+    function Telemetry.finish(fallback)
+        if upstreamFinish then upstreamFinish(Aim) end
+    end
 end
 
 --========================================================================
@@ -178,6 +271,7 @@ end
 --========================================================================
 local playerScripts = waitFor(localPlayer, "PlayerScripts", 10)
 local zombiesFolder = waitFor(Workspace, "Zombies", 10)
+local playerPerks   = waitFor(localPlayer, "PlayerPerks", 10)
 
 local packetRemote
 do
@@ -257,8 +351,6 @@ if networkManager and networkManager.PassData and hookfunction then
         return originalPassData(table.unpack(args, 1, args.n))
     end)
     log("packet sanitiser installed")
-else
-    log("packet sanitiser unavailable (NetworkManager or hookfunction missing)")
 end
 
 --========================================================================
@@ -358,6 +450,25 @@ end))
 --========================================================================
 -- Silent aim: rewrite the outgoing WeaponAttack packet
 --========================================================================
+-- The server credits headshot vs body by which part we report hitting.
+-- When spoofing, roll per pellet: keep it a head some % of the time,
+-- otherwise report a torso part (a body shot) from the same zombie.
+local BODY_PARTS = { "HumanoidRootPart", "UpperTorso", "Torso", "LowerTorso" }
+
+local function reportPart(aimPart)
+    if not Aim.SpoofBodyShots then return aimPart end
+    local model = aimPart.Parent
+    if not model then return aimPart end
+    if math.random(1, 100) <= (Aim.HeadShotPercent or 70) then
+        return model:FindFirstChild("Head") or aimPart
+    end
+    for _, name in ipairs(BODY_PARTS) do
+        local bp = model:FindFirstChild(name)
+        if bp then return bp end
+    end
+    return aimPart
+end
+
 local function rewriteAttack(packet)
     local attack = packet.WeaponAttack and packet.WeaponAttack[1]
     if not (attack and attack[3]) then return end
@@ -385,8 +496,9 @@ local function rewriteAttack(packet)
     for i = 1, pellets do
         local part = chosen[((i - 1) % #chosen) + 1]
         if part then
-            local pos = vec3(part.Position.X, part.Position.Y, part.Position.Z)
-            hits[i] = { part, pos, true }
+            local reported = reportPart(part)
+            local pos = vec3(reported.Position.X, reported.Position.Y, reported.Position.Z)
+            hits[i] = { reported, pos, true }
         end
     end
 
@@ -407,14 +519,33 @@ local function rewriteAttack(packet)
     end
 end
 
+-- Force crit on every pellet of an outgoing attack, independent of the
+-- aimbot. This is the "100% Crit" toggle's worker: the server decides
+-- crit from attack[3].CriticalRolls, so we set them all true.
+local function forceCrit(packet)
+    local attack = packet.WeaponAttack and packet.WeaponAttack[1]
+    if not (attack and attack[3]) then return end
+    local rolls = attack[3].CriticalRolls
+    if not rolls then
+        rolls = {}
+        attack[3].CriticalRolls = rolls
+    end
+    local pellets = (attack[2] and #attack[2]) or 0
+    if pellets < 1 then pellets = 1 end
+    for i = 1, math.max(pellets, #rolls) do
+        rolls[i] = true
+    end
+end
+
 if packetRemote and hookmetamethod then
     local originalNamecall
     originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
         if getnamecallmethod() == "FireServer" and self == packetRemote then
             local args = table.pack(...)
             local packet = args[1]
-            if Aim.Enabled and type(packet) == "table" and packet.WeaponAttack then
-                pcall(rewriteAttack, packet)
+            if type(packet) == "table" and packet.WeaponAttack then
+                if Aim.Enabled then pcall(rewriteAttack, packet) end
+                if Misc.ForceCrit then pcall(forceCrit, packet) end
             end
             return originalNamecall(self, table.unpack(args, 1, args.n))
         end
@@ -422,12 +553,11 @@ if packetRemote and hookmetamethod then
     end)
     log("silent aim installed")
 else
-    log("PacketRemote or hookmetamethod missing — silent aim disabled")
+    log("PacketRemote missing — silent aim disabled")
 end
 
 --========================================================================
 -- Equipped weapon tracking
--- No Recoil needs to know which tool you are holding.
 --========================================================================
 local equippedToolName = nil
 local reequipping      = false   -- true while we are mid unequip/equip
@@ -493,9 +623,6 @@ end
 
 --========================================================================
 -- No Recoil
--- The game keeps live weapon spread in Tool.CurrentValues. Recoil is
--- just spread climbing as you fire, so holding SpreadIncrease and
--- ZoomSpreadIncrease at 0 every frame removes the kick entirely.
 --========================================================================
 local function clearSpread()
     if not equippedToolName then return end
@@ -537,16 +664,12 @@ end
 
 --========================================================================
 -- Trigger bot
--- There is no "shoot" remote to call directly. The game listens to its
--- own mobile Attack button, so this fires that button's connections:
--- MouseButton1Down to start shooting, InputEnded + MouseButton1Up to stop.
 --========================================================================
 local attackButton     = nil
 local lastButtonLookup = 0
 local triggerHolding   = false
+local holdStartedAt    = 0
 
--- Cached, because walking PlayerGui every frame is wasteful. Re-looks up
--- at most twice a second.
 local function findAttackButton()
     if attackButton and attackButton.Parent then
         return attackButton
@@ -576,7 +699,9 @@ end
 
 local function releaseAttack(button)
     fireAll(button.InputEnded)
-    fireAll(button.MouseButton1Up)
+    pcall(function()
+        fireAll(button.MouseButton1Up)
+    end)
 end
 
 local function stopHolding()
@@ -588,21 +713,412 @@ local function stopHolding()
 end
 
 track(RunService.RenderStepped:Connect(function()
-    -- Nothing in range, or the trigger bot is off: make sure we let go,
-    -- but only if we were actually holding.
-    if not primaryTarget or not Aim.TriggerBot then
-        if triggerHolding then
-            stopHolding()
-        end
+    if not primaryTarget then
+        if triggerHolding then stopHolding() end
+        return
+    end
+
+    if not Aim.TriggerBot then
+        if triggerHolding then stopHolding() end
         return
     end
 
     local button = findAttackButton()
     if not button then return end
 
-    -- Re-press every frame so automatic weapons keep cycling.
     pressAttack(button)
     triggerHolding = true
+    holdStartedAt = tick()
+end))
+
+--========================================================================
+-- Perk auto-buy
+--========================================================================
+local PERK_CATEGORIES = {
+    "DefensivePerks", "EconomyPerks", "HybridPerks",
+    "OffensivePerks", "UtilityPerks",
+}
+
+local function getPerksRoot()
+    return resolve(ReplicatedStorage,
+        "MenuGui", "UnlocksFrame", "Unlocks", "MobileTest", "Perks")
+end
+
+local function buyAllPerks()
+    local perksRoot = getPerksRoot()
+    if not perksRoot then
+        return false, "perk menu not found"
+    end
+
+    local prestigePerk = resolve(ReplicatedStorage, "RemoteFunctions", "PrestigePerk")
+    if not prestigePerk then
+        return false, "PrestigePerk remote not found"
+    end
+
+    local names = {}
+    for _, category in ipairs(PERK_CATEGORIES) do
+        local group = perksRoot:FindFirstChild(category)
+        local perks = group and group:FindFirstChild("Perks")
+        if perks then
+            for _, button in ipairs(perks:GetChildren()) do
+                if button:IsA("ImageButton") then
+                    table.insert(names, button.Name)
+                end
+            end
+        end
+    end
+
+    for _, name in ipairs(names) do
+        task.spawn(function()
+            pcall(function() prestigePerk:InvokeServer(name) end)
+        end)
+        task.wait(0.025)
+    end
+    return true, #names .. " perk(s) attempted"
+end
+
+-- Equip a saved perk loadout (slots 1-5).
+local perkLoadoutSlot = 1
+local function equipPerkLoadout(slot)
+    slot = tonumber(slot) or perkLoadoutSlot or 1
+    local remote = resolve(ReplicatedStorage, "RemoteEvents", "RemotePerkLoadout")
+    if not remote then
+        return false, "RemotePerkLoadout not found"
+    end
+    local ok = pcall(function() remote:FireServer(2, slot) end)
+    if ok then
+        return true, "equipped loadout " .. slot
+    end
+    return false, "failed to fire loadout " .. slot
+end
+
+--========================================================================
+-- DPS panel
+--========================================================================
+local function parseStat(str)
+    if type(str) ~= "string" then return nil end
+    local base = tonumber(str:match("^([%d%.]+)"))
+    local mult = tonumber(str:match("%*(%d+)")) or 1
+    local x    = tonumber(str:match("%(x([%d%.]+)%)")) or 1
+    if not base then return nil end
+    return base * mult * x
+end
+
+local function computeDPS(damageStr, speedStr, holdType, clipStr, reloadStr, consumeStr)
+    local damage = parseStat(damageStr)
+    local speed  = parseStat(speedStr)
+    if not damage or not speed then return 0, 0 end
+
+    local clip    = parseStat(clipStr)
+    local reload  = parseStat(reloadStr)
+    local consume = parseStat(consumeStr) or 1
+
+    local perSecond = speed > 0 and (1 / speed) or 0
+    local low  = damage * perSecond
+    local high = low
+
+    if clip and reload and reload > 0 then
+        local shotsPerClip = math.max(1, clip / consume)
+        local burst = shotsPerClip * speed
+        low = (damage * shotsPerClip) / (burst + reload)
+    end
+
+    if holdType then
+        low, high = low * 2, high * 2
+    end
+    return math.floor(low + 0.5), math.floor(high + 0.5)
+end
+
+local dpsConnection = nil
+
+local function startDPSPanel()
+    if dpsConnection then return end
+
+    dpsConnection = RunService.RenderStepped:Connect(function()
+        local stats = resolve(localPlayer:FindFirstChild("PlayerGui"),
+            "ScreenGui", "ShopFrame", "Information", "StatsFrame", "Frame", "Stats")
+        if not stats then return end
+
+        local damage = stats:FindFirstChild("Damage")
+        local speed  = stats:FindFirstChild("AttackSpeed")
+
+        if not (damage and speed and damage.Visible and speed.Visible) then
+            local old = stats:FindFirstChild("DPS")
+            if old then old.Visible = false end
+            return
+        end
+
+        local row = stats:FindFirstChild("DPS")
+        if not row then
+            local template = stats:FindFirstChild("StatTemplate")
+            if not template then return end
+            row = template:Clone()
+            row.Name = "DPS"
+            row.Stat.Text = "DPS: "
+            row.Value.Text = "0"
+            row.Value.TextColor3 = Color3.fromRGB(255, 200, 40)
+            row.LayoutOrder = 99
+            row.Parent = stats
+        end
+
+        local function text(stat)
+            return stat and stat.Visible and stat:FindFirstChild("Value") and stat.Value.Text or nil
+        end
+
+        local holdTypeStat = stats:FindFirstChild("HoldType")
+        local holdType = holdTypeStat and holdTypeStat.Visible
+            and holdTypeStat:FindFirstChild("Value")
+            and holdTypeStat.Value.Text == "Yes"
+
+        local low, high = computeDPS(
+            damage.Value.Text, speed.Value.Text, holdType,
+            text(stats:FindFirstChild("MaxClip")),
+            text(stats:FindFirstChild("ReloadSpeed")),
+            text(stats:FindFirstChild("Consume")))
+
+        row.Value.Text = (low == high) and tostring(low)
+            or string.format("%d (%d)", low, high)
+        row.Visible = true
+    end)
+    track(dpsConnection)
+end
+
+local function stopDPSPanel()
+    if dpsConnection then
+        dpsConnection:Disconnect()
+        dpsConnection = nil
+    end
+end
+
+--========================================================================
+-- Auto-farm helpers
+--========================================================================
+local farm = {
+    noclipSelf   = false,
+    autoReload   = false,
+    teleToAmmo   = false,
+    voteSkip     = false,
+    fullAuto     = false,
+}
+local reloadCooldown = 0
+local voteCooldown   = 0
+local originalFireType = {}
+
+local function getAmmoBox()
+    local lid = resolve(Workspace, "Map", "Upgrades", "AmmoBox", "InvisLid")
+    return lid
+end
+
+local function pressReload()
+    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.F, false, game)
+    task.delay(0.1, function()
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.F, false, game)
+    end)
+end
+
+track(RunService.Stepped:Connect(function()
+    if not farm.noclipSelf then return end
+    local character = localPlayer.Character
+    if not character then return end
+    for _, part in ipairs(character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = false
+        end
+    end
+end))
+
+track(RunService.Heartbeat:Connect(function()
+    if not farm.teleToAmmo then return end
+    local character = localPlayer.Character
+    local humanoid  = character and character:FindFirstChildOfClass("Humanoid")
+    local root      = character and character:FindFirstChild("HumanoidRootPart")
+    if not (humanoid and root) then return end
+    local lid = getAmmoBox()
+    if lid and (root.Position - lid.Position).Magnitude > 5 then
+        humanoid:MoveTo(lid.Position)
+    end
+end))
+
+track(RunService.RenderStepped:Connect(function()
+    if not farm.autoReload or not equippedToolName then return end
+
+    local now = tick()
+    if now - reloadCooldown < 0.1 then return end
+
+    local lid = getAmmoBox()
+    local root = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not (lid and root and (root.Position - lid.Position).Magnitude <= 15) then return end
+
+    local tool = localPlayer.Character:FindFirstChild(equippedToolName)
+    local values = tool and tool:FindFirstChild("CurrentValues")
+    if not values then return end
+
+    local clip    = values:FindFirstChild("Clip")
+    local ammo    = values:FindFirstChild("Ammo")
+    local maxClip = values:FindFirstChild("MaxClip")
+    if not (clip and ammo and maxClip) then return end
+
+    local c, a, m = clip.Value, ammo.Value, maxClip.Value
+    local shouldReload
+    if a == 0 then
+        shouldReload = c < m * 0.3
+    else
+        shouldReload = (a <= c) or (c + a < m)
+    end
+
+    if shouldReload then
+        reloadCooldown = now
+        pressReload()
+    end
+end))
+
+track(RunService.RenderStepped:Connect(function()
+    if not farm.voteSkip then return end
+
+    local button = resolve(localPlayer:FindFirstChild("PlayerGui"),
+        "ScreenGui", "GameFrame", "Core", "WeaponFrame", "VoteSkip")
+    if not (button and button.Visible) then return end
+    if not button.Text:find("Ready Up") then return end
+
+    local now = tick()
+    if now - voteCooldown < 3 then return end
+
+    pcall(function()
+        local skipGui = require(resolve(localPlayer:FindFirstChild("PlayerScripts"),
+            "GuiManager", "MainGui", "SkipGui"))
+        if skipGui and not skipGui.Voted then
+            voteCooldown = now
+            skipGui:Vote()
+        end
+    end)
+end))
+
+track(RunService.Heartbeat:Connect(function()
+    if not farm.fullAuto or not equippedToolName then return end
+    local tool = localPlayer.Character and localPlayer.Character:FindFirstChild(equippedToolName)
+    local values = tool and tool:FindFirstChild("CurrentValues")
+    local fireType = values and values:FindFirstChild("FireType")
+    if not fireType then return end
+
+    if originalFireType[equippedToolName] == nil then
+        originalFireType[equippedToolName] = fireType.Value
+    end
+    if fireType.Value ~= "FullAuto" then
+        fireType.Value = "FullAuto"
+    end
+end))
+
+local function restoreFireTypes()
+    local character = localPlayer.Character
+    for name, original in pairs(originalFireType) do
+        local tool = character and character:FindFirstChild(name)
+        local values = tool and tool:FindFirstChild("CurrentValues")
+        local fireType = values and values:FindFirstChild("FireType")
+        if fireType then
+            pcall(function() fireType.Value = original end)
+        end
+    end
+    table.clear(originalFireType)
+end
+
+--========================================================================
+-- RunGun perk
+--========================================================================
+local runGunAdded = false
+
+local function setRunGun(enabled)
+    if not playerPerks then return end
+    if enabled then
+        if not playerPerks:FindFirstChild("RunGun") then
+            local value = Instance.new("NumberValue")
+            value.Name  = "RunGun"
+            value.Value = 1
+            value.Parent = playerPerks
+            runGunAdded = true
+        end
+    elseif runGunAdded then
+        local value = playerPerks:FindFirstChild("RunGun")
+        if value then value:Destroy() end
+        runGunAdded = false
+    end
+end
+
+--========================================================================
+-- FOV circle (Drawing API, visual only)
+--========================================================================
+local fovCircleOn = true
+local fovCircle   = nil
+
+if typeof(Drawing) == "table" or type(Drawing) == "table" then
+    local ok, circle = pcall(function()
+        local c = Drawing.new("Circle")
+        c.Thickness    = 2
+        c.NumSides     = 64
+        c.Filled       = false
+        c.Transparency = 1
+        c.Visible      = false
+        return c
+    end)
+    if ok then fovCircle = circle end
+end
+
+if fovCircle then
+    local AMBER = Color3.fromRGB(255, 200, 40)
+    local RED   = Color3.fromRGB(255, 60, 30)
+
+    track(RunService.RenderStepped:Connect(function()
+        if not (fovCircleOn and Aim.Enabled and Aim.TargetMode == "Mouse") then
+            fovCircle.Visible = false
+            return
+        end
+        local mouse = UserInputService:GetMouseLocation()
+        fovCircle.Position = mouse
+        fovCircle.Radius   = Aim.FOV
+        fovCircle.Color    = primaryTarget and RED or AMBER
+        fovCircle.Visible  = true
+    end))
+
+    track({ Disconnect = function()
+        if fovCircle then pcall(function() fovCircle:Remove() end) end
+    end })
+end
+
+--========================================================================
+-- Invisible (your own character only)
+--========================================================================
+local invisible = false
+local originalTransparency = {}
+
+local function restoreVisible()
+    for part, t in pairs(originalTransparency) do
+        if part and part.Parent then
+            pcall(function() part.Transparency = t end)
+        end
+    end
+    table.clear(originalTransparency)
+end
+
+local function setInvisible(state)
+    invisible = state
+    if not state then restoreVisible() end
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if not invisible then return end
+    local character = localPlayer.Character
+    if not character then return end
+    for _, d in ipairs(character:GetDescendants()) do
+        if (d:IsA("BasePart") or d:IsA("Decal")) and d.Transparency ~= 1 then
+            if originalTransparency[d] == nil then
+                originalTransparency[d] = d.Transparency
+            end
+            d.Transparency = 1
+        end
+    end
+end))
+
+track(localPlayer.CharacterAdded:Connect(function()
+    table.clear(originalTransparency)
 end))
 
 --========================================================================
@@ -611,6 +1127,9 @@ end))
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
 local level, prestige = readPlayerStats()
+
+-- Fire the run logger. Spawned so a slow HTTP call never delays the UI.
+task.spawn(function() Telemetry.start() end)
 
 local Window = Rayfield:CreateWindow({
     Name            = "Straight Bullshit",
@@ -627,7 +1146,10 @@ AimTab:CreateToggle({
 })
 AimTab:CreateToggle({
     Name = "Trigger Bot", CurrentValue = Aim.TriggerBot, Flag = "TriggerBot",
-    Callback = function(v) Aim.TriggerBot = v end,
+    Callback = function(v)
+        Aim.TriggerBot = v
+        Telemetry.event("TriggerBot", v)
+    end,
 })
 AimTab:CreateDropdown({
     Name = "Target Mode", Options = { "Mouse", "Distance" },
@@ -658,17 +1180,111 @@ AimTab:CreateToggle({
     Name = "Ignore Swamp Giant", CurrentValue = Aim.IgnoreSwampGiant, Flag = "IgnoreGiant",
     Callback = function(v) Aim.IgnoreSwampGiant = v end,
 })
+AimTab:CreateToggle({
+    Name = "Spoof Body Shots", CurrentValue = Aim.SpoofBodyShots, Flag = "SpoofBody",
+    Callback = function(v)
+        Aim.SpoofBodyShots = v
+        Telemetry.event("SpoofBody", v)
+    end,
+})
 AimTab:CreateSlider({
-    Name = "Max Distance", Range = { 100, 100000 }, Increment = 100, Suffix = " studs",
-    CurrentValue = math.min(Aim.MaxDistance, 100000), Flag = "MaxDistance",
-    Callback = function(v) Aim.MaxDistance = v end,
+    Name = "Headshot % (reported)", Range = { 0, 100 }, Increment = 5, Suffix = "%",
+    CurrentValue = Aim.HeadShotPercent, Flag = "HeadShotPct",
+    Callback = function(v) Aim.HeadShotPercent = v end,
+})
+AimTab:CreateToggle({
+    Name = "Show FOV Circle", CurrentValue = fovCircleOn, Flag = "ShowFOV",
+    Callback = function(v)
+        fovCircleOn = v
+        if fovCircle and not v then fovCircle.Visible = false end
+    end,
+})
+AimTab:CreateToggle({
+    Name = "100% Crit", CurrentValue = Misc.ForceCrit, Flag = "ForceCrit",
+    Callback = function(v)
+        Misc.ForceCrit = v
+        getgenv().ForceCrit = v
+        Telemetry.event("ForceCrit", v)
+    end,
 })
 
 local MiscTab = Window:CreateTab("Misc", 4483362458)
 
 MiscTab:CreateToggle({
     Name = "No Recoil", CurrentValue = Misc.NoRecoil, Flag = "NoRecoil",
-    Callback = setNoRecoil,
+    Callback = function(v)
+        setNoRecoil(v)
+        Telemetry.event("NoRecoil", v)
+    end,
+})
+MiscTab:CreateToggle({
+    Name = "Invisible", CurrentValue = false, Flag = "Invisible",
+    Callback = function(v) setInvisible(v); Telemetry.event("Invisible", v) end,
+})
+MiscTab:CreateToggle({
+    Name = "RunGun (fire while sprinting)", CurrentValue = false, Flag = "RunGun",
+    Callback = function(v) setRunGun(v); Telemetry.event("RunGun", v) end,
+})
+MiscTab:CreateButton({
+    Name = "Buy All Perks",
+    Callback = function()
+        local ok, msg = buyAllPerks()
+        Telemetry.event("BuyAllPerks", true)
+        Rayfield:Notify({ Title = "Perks", Content = msg, Duration = 3 })
+    end,
+})
+MiscTab:CreateDropdown({
+    Name = "Perk Loadout Slot", Options = { "1", "2", "3", "4", "5" },
+    CurrentOption = { "1" }, Flag = "PerkLoadoutSlot",
+    Callback = function(opt)
+        perkLoadoutSlot = tonumber(type(opt) == "table" and opt[1] or opt) or 1
+    end,
+})
+MiscTab:CreateButton({
+    Name = "Equip Perk Loadout",
+    Callback = function()
+        local ok, msg = equipPerkLoadout(perkLoadoutSlot)
+        Telemetry.event("EquipPerkLoadout", true)
+        Rayfield:Notify({ Title = "Perks", Content = msg, Duration = 3 })
+    end,
+})
+MiscTab:CreateToggle({
+    Name = "DPS Panel", CurrentValue = false, Flag = "DPSPanel",
+    Callback = function(v)
+        if v then startDPSPanel() else stopDPSPanel() end
+        Telemetry.event("DPSPanel", v)
+    end,
+})
+MiscTab:CreateToggle({
+    Name = "Farm: No-Clip Self", CurrentValue = false, Flag = "FarmNoclip",
+    Callback = function(v) farm.noclipSelf = v; Telemetry.event("FarmNoclip", v) end,
+})
+MiscTab:CreateToggle({
+    Name = "Farm: Auto Reload", CurrentValue = false, Flag = "FarmReload",
+    Callback = function(v) farm.autoReload = v; Telemetry.event("FarmReload", v) end,
+})
+MiscTab:CreateToggle({
+    Name = "Farm: Stay On Ammo Box", CurrentValue = false, Flag = "FarmTele",
+    Callback = function(v) farm.teleToAmmo = v; Telemetry.event("FarmTele", v) end,
+})
+MiscTab:CreateToggle({
+    Name = "Farm: Auto Vote-Skip", CurrentValue = false, Flag = "FarmVoteSkip",
+    Callback = function(v) farm.voteSkip = v; Telemetry.event("FarmVoteSkip", v) end,
+})
+MiscTab:CreateToggle({
+    Name = "Farm: Force Full Auto", CurrentValue = false, Flag = "FarmFullAuto",
+    Callback = function(v)
+        farm.fullAuto = v
+        if not v then restoreFireTypes() end
+        Telemetry.event("FarmFullAuto", v)
+    end,
+})
+MiscTab:CreateButton({
+    Name = "Show My Stats (console)",
+    Callback = function()
+        Telemetry.summary()
+        Rayfield:Notify({ Title = "Telemetry", Content = "Printed to console (F9)", Duration = 3 })
+    end,
 })
 MiscTab:CreateButton({
     Name = "Print Target Count",
@@ -680,31 +1296,41 @@ MiscTab:CreateButton({
         })
     end,
 })
+local function unload()
+    Telemetry.finish()        -- session-end report: duration + live settings
+    cleanup()                 -- also calls Telemetry.finish (idempotent) + reset
+    task.spawn(reequipWeapon) -- let the game restore normal spread
+    Rayfield:Destroy()
+end
+
+local menuVisible = true
+local function toggleMenu()
+    menuVisible = not menuVisible
+    if menuVisible then
+        pcall(function() Rayfield:Unhide() end)
+    else
+        pcall(function() Rayfield:Hide() end)
+    end
+end
+
 MiscTab:CreateButton({
     Name = "Unload Script",
-    Callback = function()
-        cleanup()
-        task.spawn(reequipWeapon)   -- let the game restore normal spread
-        Rayfield:Destroy()
-    end,
+    Callback = unload,
+})
+
+MiscTab:CreateKeybind({
+    Name           = "Toggle Menu Key",
+    CurrentKeybind = "RightShift",
+    HoldToInteract = false,
+    Flag           = "ToggleMenuKey",
+    Callback       = function() toggleMenu() end,
+})
+MiscTab:CreateKeybind({
+    Name           = "Panic Unload Key",
+    CurrentKeybind = "End",
+    HoldToInteract = false,
+    Flag           = "PanicKey",
+    Callback       = unload,
 })
 
 log("loaded — level " .. level .. ", prestige " .. prestige)
-
--- Fire the run logger. Spawned so a slow HTTP call never delays the menu.
-if type(Logger.start) == "function" then
-    task.spawn(function() Logger.start() end)
-end
-
---[[
-    NOT PORTED YET — the logic for these is in "DIDDY deobfuscated.lua":
-
-      Auto farm mode            lines 3287-4178  (LoadAutoFarmMode)
-      FOV circle (Drawing API)  line 3120   (visual only, not ported)
-      Perk auto-buy             line 327    (PrestigePerk InvokeServer)
-      DPS / stats panel         lines 358-571
-      RunGun perk toggle        lines 100-120
-
-    The Misc.AutoFarmMode flag exists; add the behaviour under it when you
-    port each one. Everything else in this file is faithful to the original.
---]]
