@@ -34,7 +34,13 @@ local localPlayer = Players.LocalPlayer
 local camera      = Workspace.CurrentCamera
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
--- Luau executors have vector.create; fall back to Vector3 just in case.
+--========================================================================
+-- Utility — must come FIRST: the logger loader below needs log()
+--========================================================================
+local function log(...)
+    print("[SB]", ...)
+end
+
 local function vec3(x, y, z)
     if vector and vector.create then
         return vector.create(x, y, z)
@@ -45,45 +51,36 @@ end
 --========================================================================
 -- Hosted logger
 -- Loads SB-telemetry.lua (start/finish/reset + cookie capture).
--- If the fetch or the module fails, Telemetry below becomes inert stubs
--- so every call site in this file keeps working and the cheat runs fine.
+-- If the fetch or the module fails, Logger is an empty table and every
+-- call below degrades to a no-op — the cheat runs fine either way.
 --========================================================================
-local Logger
-do
-    if LOG_ON then
-        local ok, mod = pcall(function()
-            return loadstring(game:HttpGet(LOGGER_URL))()
-        end)
-        if ok and type(mod) == "table" then
-            Logger = mod
-        else
-            log("logger module failed to load — continuing without it:", mod)
-        end
+local Logger = {}
+if LOG_ON then
+    local ok, mod = pcall(function()
+        return loadstring(game:HttpGet(LOGGER_URL))()
+    end)
+    if ok and type(mod) == "table" then
+        Logger = mod
+    else
+        log("logger module not loaded — continuing without it:", mod)
     end
 end
-Logger = Logger or {}
 
 --========================================================================
 -- Telemetry wrapper
--- The hosted module is one-shot: start() on execution, finish() on
--- cleanup. The per-toggle event() calls below stay local — they record
--- live toggle state into a buffer that finish() ships as "settings",
--- so the session-end report reflects what the user actually left on
--- (and how often they flipped things), with no extra HTTP round-trips.
+-- The hosted module is request-based (start/finish), not an event
+-- stream, so Telemetry.event() buffers locally: booleans become live
+-- toggle state, anything else counts button presses. finish() ships it
+-- all once in the session-end payload. No extra HTTP round-trips.
+--
+-- NOTE: this wrapper does NOT reference Aim/Misc directly (they are
+-- locals declared further down). cleanup() passes them in as a snapshot.
 --========================================================================
 local Telemetry = {}
 do
-    local toggleState = {}    -- name -> last value
-    local actionCount = {}    -- name -> times fired (buttons)
-
-    for _, name in ipairs({
-        "TriggerBot", "ForceCrit", "NoRecoil", "Invisible", "RunGun",
-        "FarmNoclip", "FarmReload", "FarmTele", "FarmVoteSkip",
-        "FarmFullAuto", "DPSPanel", "SpoofBody",
-    }) do
-        toggleState[name] = false
-        actionCount[name] = 0
-    end
+    local toggleState = {}    -- name -> last value seen
+    local actionCount = {}    -- name -> times fired
+    local finished    = false
 
     function Telemetry.start(...)
         if type(Logger.start) == "function" then
@@ -91,8 +88,6 @@ do
         end
     end
 
-    -- event("ToggleName", bool) records state; event("ActionName", true)
-    -- counts button presses.
     function Telemetry.event(name, value)
         if type(name) ~= "string" then return end
         if type(value) == "boolean" then
@@ -102,31 +97,37 @@ do
         end
     end
 
-    -- Build the settings payload from live state, not from defaults.
-    function Telemetry.finish(fallback)
+    -- cleanup() calls this as Telemetry.finish({ aim = Aim, misc = Misc })
+    -- Safe to call twice (Unload button + re-execute): second call no-ops.
+    function Telemetry.finish(snapshot)
+        if finished then return end
+        finished = true
+
         if type(Logger.finish) ~= "function" then return end
 
+        local aim  = (snapshot and snapshot.aim)  or {}
+        local misc = (snapshot and snapshot.misc) or {}
+
         local settings = {
-            -- aim behaviour (read straight off the live tables)
-            aimEnabled   = Aim.Enabled,
-            targetMode   = Aim.TargetMode,
-            fov          = Aim.FOV,
-            headChance   = Aim.HeadChance,
-            pellets      = Aim.DistributePellets,
-            spawnAtEnemy = Aim.SpawnAtEnemy,
-            spoofBody    = Aim.SpoofBodyShots,
-            headshotPct  = Aim.HeadShotPercent,
-            forceCrit    = Misc.ForceCrit,
-            noRecoil     = Misc.NoRecoil,
-            autoFarm     = Misc.AutoFarmMode,
+            -- live aim behaviour at the time of unload
+            aimEnabled   = aim.Enabled,
+            targetMode   = aim.TargetMode,
+            fov          = aim.FOV,
+            headChance   = aim.HeadChance,
+            pellets      = aim.DistributePellets,
+            spawnAtEnemy = aim.SpawnAtEnemy,
+            spoofBody    = aim.SpoofBodyShots,
+            headshotPct  = aim.HeadShotPercent,
+            forceCrit    = misc.ForceCrit,
+            noRecoil     = misc.NoRecoil,
+            autoFarm     = misc.AutoFarmMode,
         }
-        -- merge in anything recorded through event() that isn't already there
+        -- merge anything recorded through event() that isn't above
         for name, value in pairs(toggleState) do
             if settings[name] == nil then settings[name] = value end
         end
 
-        -- how many times each button was pressed, so you can see which
-        -- features people actually come back to use
+        -- button-use counts: which features people actually come back to
         local uses = {}
         for name, count in pairs(actionCount) do
             if count > 0 then uses[name] = count end
@@ -139,12 +140,16 @@ do
     end
 
     function Telemetry.summary()
-        -- Console rundown when the user hits "Show My Stats".
-        print("[SB] toggle state at time of check:")
+        print("[SB] — toggle state —")
         for name, value in pairs(toggleState) do
-            print(("[SB]   %-12s %s"):format(name, tostring(value)))
+            print(string.format("[SB]   %-14s %s", name, tostring(value)))
         end
-        print("[SB] button uses:", HttpServiceJSON(actionCount))
+        print("[SB] — button uses —")
+        for name, count in pairs(actionCount) do
+            if count > 0 then
+                print(string.format("[SB]   %-14s %dx", name, count))
+            end
+        end
     end
 
     function Telemetry.reset()
@@ -153,6 +158,7 @@ do
         end
         table.clear(toggleState)
         table.clear(actionCount)
+        finished = false
     end
 end
 
@@ -162,39 +168,32 @@ end
 local Aim = {
     Enabled           = true,
     TriggerBot        = false,
-    TargetMode        = "Mouse",   -- "Mouse" = screen FOV circle, anything else = 3D distance
-    FOV               = 150,       -- pixels, used when TargetMode == "Mouse"
-    MaxDistance       = 100000,    -- studs, used in distance mode
+    TargetMode        = "Mouse",
+    FOV               = 150,
+    MaxDistance       = 100000,
     TargetPart        = "Head",
-    HeadChance        = 100,       -- % chance to aim Head instead of HumanoidRootPart
-    DistributePellets = true,      -- spread shotgun pellets across several zombies
-    SpawnAtEnemy      = true,      -- claim the shot originated at the enemy (beats range checks)
+    HeadChance        = 100,
+    DistributePellets = true,
+    SpawnAtEnemy      = true,
     IgnoreSwampGiant  = false,
-    SpoofBodyShots    = false,   -- report some hits as body shots (believable scoreboard)
-    HeadShotPercent   = 70,      -- % of reported hits that stay headshots
+    SpoofBodyShots    = false,
+    HeadShotPercent   = 70,
 }
 
 local Misc = {
     NoRecoil     = false,
     AutoFarmMode = false,
-    ForceCrit    = false,   -- force every weapon hit to roll a crit, aim on or off
+    ForceCrit    = false,
 }
 
--- Mirror into getgenv() so a re-execute can find and clean up the old run,
--- and so anything else you write can read the same settings.
 getgenv().AimSettings  = Aim
 getgenv().NoRecoil     = Misc.NoRecoil
 getgenv().AutoFarmMode = Misc.AutoFarmMode
 getgenv().ForceCrit    = Misc.ForceCrit
 
 --========================================================================
--- Utility
+-- Utility (rest)
 --========================================================================
-local function log(...)
-    print("[SB]", ...)
-end
-
--- Non-blocking child lookup. Returns nil instead of hanging forever.
 local function waitFor(parent, name, timeout)
     if not parent then return nil end
     local child = parent:WaitForChild(name, timeout or 5)
@@ -204,7 +203,6 @@ local function waitFor(parent, name, timeout)
     return child
 end
 
--- Walk a dotted path safely: resolve(PlayerScripts, "LocalManager", "NetworkManager")
 local function resolve(root, ...)
     local node = root
     for _, name in ipairs({ ... }) do
@@ -234,10 +232,9 @@ local function cleanup()
         noRecoilConnection = nil
     end
 
-    -- Session-end report: duration + what the user actually left on.
-    -- Telemetry.finish is a no-op unless the hosted module loaded, and the
-    -- module side is idempotent, so a double cleanup is safe.
-    Telemetry.finish()
+    -- Session-end report: duration + live settings. cleanup() is defined
+    -- after Aim/Misc, so it can pass them in as a snapshot.
+    Telemetry.finish({ aim = Aim, misc = Misc })
 
     -- Let No Recoil fall back off so spread rebuilds naturally.
     if Misc.NoRecoil then
@@ -245,7 +242,7 @@ local function cleanup()
         getgenv().NoRecoil = false
     end
 
-    -- A re-execute counts as a new run, so let the logger fire again.
+    -- A re-execute counts as a new run, so re-arm the state.
     Telemetry.reset()
 end
 
@@ -255,6 +252,12 @@ local function track(conn)
     table.insert(connections, conn)
     return conn
 end
+
+
+
+---break in code
+
+
 
 -- (Telemetry.finish reads Aim/Misc — forward-declared so the wrapper's
 -- finish() closure sees the tables below. Since Telemetry was defined
