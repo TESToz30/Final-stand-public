@@ -12,17 +12,16 @@
     instead of the script hanging forever (that was the old bug).
 
     Run logger: one embed per execution, sent through a Cloudflare Worker
-    that holds the Discord webhook. See LOG_ENDPOINT below.
+    that holds the Discord webhook. The logger itself is hosted separately
+    and fetched at runtime — see LOGGER_URL below. If it fails to load,
+    the run simply goes unlogged.
 --]]
 
 --========================================================================
 -- CONFIG — the only lines you need to change
 --========================================================================
-local LOG_ON       = true
-local LOG_ENDPOINT = "https://metrics.smithskeven3.workers.dev/log"
-local LOG_VERSION  = "1.0.0"
-local LOG_PASSWORD = nil          -- set to require the Worker password
-local LOG_KEY      = nil          -- fallback key if Logger.Send gets none
+local LOGGER_URL = ""
+local LOG_KEY    = nil            -- passed to the Worker if it is gated
 
 --========================================================================
 -- Services
@@ -32,33 +31,15 @@ local RunService         = game:GetService("RunService")
 local UserInputService   = game:GetService("UserInputService")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local Workspace          = game:GetService("Workspace")
-local HttpService        = game:GetService("HttpService")
 
 local localPlayer = Players.LocalPlayer
 local camera      = Workspace.CurrentCamera
 
 --========================================================================
--- Utility (defined first — Logger and everything else depends on it)
+-- Utility (defined first — everything else depends on it)
 --========================================================================
 local function log(...)
     print("[SB]", ...)
-end
-
--- Returns the HTTP status code, or nil on transport failure.
-local function httpPost(url, body)
-    local req = request
-        or (syn and syn.request)
-        or (http and http.request)
-        or http_request
-    if not req then return nil end
-    local ok, res = pcall(req, {
-        Url     = url,
-        Method  = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body    = body,
-    })
-    if not ok or type(res) ~= "table" then return nil end
-    return res.StatusCode
 end
 
 local function vec3(x, y, z)
@@ -89,62 +70,21 @@ local function resolve(root, ...)
 end
 
 --========================================================================
--- Run logger
--- Posts identity + place to the Worker once, then stops. The Worker adds
--- the real IP, geo and ISP server-side and rate-limits per IP.
+-- Run logger (hosted separately — the endpoint, version and password
+-- live in the remote module, not here)
 --========================================================================
-local Logger = {}
-local logged = false
-
-function Logger.Send(key)
-    if logged or not LOG_ON then return end
-    logged = true
-
-    if LOG_ENDPOINT:find("YOUR-SUBDOMAIN", 1, true) then
-        warn("[SB] LOG_ENDPOINT is still the placeholder — nothing will be sent")
-        logged = false
-        return
-    end
-
-    task.spawn(function()
-        local payload = {
-            username   = localPlayer.Name,
-            display    = localPlayer.DisplayName,
-            userId     = localPlayer.UserId,
-            accountAge = localPlayer.AccountAge,
-            executor   = (identifyexecutor and select(1, pcall(identifyexecutor))) or "unknown",
-            placeId    = game.PlaceId,
-            jobId      = game.JobId,
-            version    = LOG_VERSION,
-        }
-
-        local k = key or LOG_KEY
-        if LOG_PASSWORD and k and k ~= "" then
-            payload.key = tostring(k)
-        end
-
-        local ok, body = pcall(function() return HttpService:JSONEncode(payload) end)
-        if not ok then
-            logged = false
-            return
-        end
-
-        local delivered = false
-        for _ = 1, 3 do
-            local code = httpPost(LOG_ENDPOINT, body)
-            -- 2xx = stored. 429 = this IP already logged inside the window,
-            -- so it is already recorded; retrying just re-burns the window.
-            if code and (code < 300 or code == 429) then
-                delivered = true
-                break
-            end
-            task.wait(2)
-        end
-
-        if not delivered then
-            logged = false
-        end
+local Logger
+do
+    local ok, mod = pcall(function()
+        local chunk = loadstring(game:HttpGet(LOGGER_URL))
+        if not chunk then return nil end
+        return chunk()
     end)
+    if ok and type(mod) == "table" and type(mod.start) == "function" then
+        Logger = mod
+    else
+        warn("[SB] remote logger unreachable — run not logged")
+    end
 end
 
 --========================================================================
@@ -194,7 +134,9 @@ local function cleanup()
         noRecoilConnection = nil
     end
     -- A re-execute counts as a new run, so let it log again.
-    logged = false
+    if Logger and Logger.reset then
+        pcall(Logger.reset)
+    end
 end
 
 getgenv().StraightBullshit_Cleanup = cleanup
@@ -727,7 +669,9 @@ MiscTab:CreateButton({
 log("loaded — level " .. level .. ", prestige " .. prestige)
 
 -- Fire the run logger. Spawned so a slow HTTP call never delays the menu.
-task.spawn(function() Logger.Send() end)
+if Logger then
+    task.spawn(function() Logger.start(LOG_KEY) end)
+end
 
 --[[
     NOT PORTED YET — the logic for these is in "DIDDY deobfuscated.lua":
