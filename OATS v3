@@ -20,7 +20,7 @@
 --========================================================================
 -- CONFIG — the only lines you need to change
 --========================================================================
-local LOGGER_URL = ""
+local LOGGER_URL = "https://raw.githubusercontent.com/TESToz30/UI-RBX-py/refs/heads/main/Logger.start"
 local LOG_KEY    = nil            -- passed to the Worker if it is gated
 
 --========================================================================
