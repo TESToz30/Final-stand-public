@@ -16,6 +16,80 @@
 --]]
 
 --========================================================================
+-- Clean up a previous run
+--========================================================================
+
+local previousCleanup = getgenv().StraightBullshit_Cleanup
+
+if type(previousCleanup) == "function" then
+    pcall(previousCleanup)
+end
+
+local connections = {}
+local noRecoilConnection = nil
+
+local function cleanup()
+    -- Disconnect all tracked connections
+    for _, connection in ipairs(connections) do
+        if connection then
+            pcall(function()
+                connection:Disconnect()
+            end)
+        end
+    end
+
+    table.clear(connections)
+
+    -- Disconnect the no-recoil connection
+    if noRecoilConnection then
+        pcall(function()
+            noRecoilConnection:Disconnect()
+        end)
+
+        noRecoilConnection = nil
+    end
+
+    -- Finish the current logging session
+    if Logger and type(Logger.finish) == "function" then
+        pcall(function()
+            Logger.finish({
+                settings = {
+                    targetMode   = Aim.TargetMode,
+                    fov          = Aim.FOV,
+                    headChance   = Aim.HeadChance,
+                    triggerBot   = Aim.TriggerBot,
+                    pellets      = Aim.DistributePellets,
+                    spawnAtEnemy = Aim.SpawnAtEnemy,
+                    noRecoil     = Misc.NoRecoil,
+                },
+            })
+        end)
+    end
+
+    -- Reset the logger for the next execution
+    if Logger and type(Logger.reset) == "function" then
+        pcall(Logger.reset)
+    end
+end
+
+-- Register cleanup for future executions
+getgenv().StraightBullshit_Cleanup = cleanup
+
+-- Register a connection for automatic cleanup
+local function track(connection)
+    if connection then
+        table.insert(connections, connection)
+    end
+
+    return connection
+end
+
+
+-----break in section
+
+
+
+--========================================================================
 -- CONFIG — the only lines you need to change
 --========================================================================
 local LOG_ON       = true
@@ -203,6 +277,14 @@ local function track(conn)
     table.insert(connections, conn)
     return conn
 end
+
+
+
+
+----break in section
+
+
+
 
 --========================================================================
 -- Game references (all soft — the old script died here)
