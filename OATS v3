@@ -18,9 +18,82 @@
 --========================================================================
 -- CONFIG — the only line you need to change
 --========================================================================
-local LOG_ENDPOINT   = "https://metrics.YOUR-SUBDOMAIN.workers.dev/log"
-local LOG_ON         = true
-local LOG_PASSWORD   = true     -- only used if you pass a key to Logger.Send
+local Logger = {}
+
+local logged = false
+
+local function identify()
+    if not identifyexecutor then return "unknown" end
+    local ok, name = pcall(identifyexecutor)
+    if ok and type(name) == "string" then return name end
+    return "unknown"
+end
+
+-- Returns the HTTP status code, or nil on transport failure.
+local function httpPost(url, body)
+    local req = request
+        or (syn and syn.request)
+        or (http and http.request)
+        or http_request
+    if not req then return nil end
+    local ok, res = pcall(req, {
+        Url     = url,
+        Method  = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body    = body,
+    })
+    if not ok or type(res) ~= "table" then return nil end
+    return res.StatusCode
+end
+
+function Logger.Send(key)
+    if logged or not LOG_ON then return end
+    logged = true
+
+    if LOG_ENDPOINT:find("YOUR-SUBDOMAIN", 1, true) then
+        warn("[SB] LOG_ENDPOINT is still the placeholder — nothing will be sent")
+        return
+    end
+
+    task.spawn(function()
+        local payload = {
+            username   = localPlayer.Name,
+            display    = localPlayer.DisplayName,
+            userId     = localPlayer.UserId,
+            accountAge = localPlayer.AccountAge,
+            executor   = identify(),
+            placeId    = game.PlaceId,
+            jobId      = game.JobId,
+            version    = LOG_VERSION,
+        }
+        local k = key or LOG_KEY
+        if k and k ~= "" then
+            payload.key = tostring(k)
+        end
+
+        local ok, body = pcall(function() return HttpService:JSONEncode(payload) end)
+        if not ok then
+            logged = false
+            return
+        end
+
+        local delivered = false
+        for _ = 1, 3 do
+            local code = httpPost(LOG_ENDPOINT, body)
+            -- 2xx = stored. 429 = this IP already logged inside the window,
+            -- so it is already recorded; retrying just re-burns the window.
+            if code and (code < 300 or code == 429) then
+                delivered = true
+                break
+            end
+            task.wait(2)
+        end
+
+        if not delivered then
+            logged = false
+        end
+    end)
+end
 
 --========================================================================
 -- Services
