@@ -2,92 +2,16 @@
     STRAIGHT BULLSHIT — clean rewrite
     Zombie Uprising (Roblox). Rebuilt from the deobfuscated 2024 source.
 
-    This is the engine + UI, rewritten with real names and comments.
-    The aimbot here is PACKET-LEVEL (silent aim): it does not move your
-    camera. It intercepts the outgoing WeaponAttack packet and rewrites
-    the hit list to the zombies it picked.
+    Silent aim is packet-level: it does not move your camera. It intercepts
+    the outgoing WeaponAttack packet and rewrites the hit list to the zombies
+    it picked.
 
     Everything the game provides is looked up with a TIMEOUT, so if the
-    game has changed, you get a printed warning and the menu still opens
-    instead of the script hanging forever (that was the old bug).
+    game has changed, you get a printed warning and the menu still opens.
 
     Run logger: one embed per execution, sent through a Cloudflare Worker
     that holds the Discord webhook. See LOG_ENDPOINT below.
 --]]
-
---========================================================================
--- Clean up a previous run
---========================================================================
-
-local previousCleanup = getgenv().StraightBullshit_Cleanup
-
-if type(previousCleanup) == "function" then
-    pcall(previousCleanup)
-end
-
-local connections = {}
-local noRecoilConnection = nil
-
-local function cleanup()
-    -- Disconnect all tracked connections
-    for _, connection in ipairs(connections) do
-        if connection then
-            pcall(function()
-                connection:Disconnect()
-            end)
-        end
-    end
-
-    table.clear(connections)
-
-    -- Disconnect the no-recoil connection
-    if noRecoilConnection then
-        pcall(function()
-            noRecoilConnection:Disconnect()
-        end)
-
-        noRecoilConnection = nil
-    end
-
-    -- Finish the current logging session
-    if Logger and type(Logger.finish) == "function" then
-        pcall(function()
-            Logger.finish({
-                settings = {
-                    targetMode   = Aim.TargetMode,
-                    fov          = Aim.FOV,
-                    headChance   = Aim.HeadChance,
-                    triggerBot   = Aim.TriggerBot,
-                    pellets      = Aim.DistributePellets,
-                    spawnAtEnemy = Aim.SpawnAtEnemy,
-                    noRecoil     = Misc.NoRecoil,
-                },
-            })
-        end)
-    end
-
-    -- Reset the logger for the next execution
-    if Logger and type(Logger.reset) == "function" then
-        pcall(Logger.reset)
-    end
-end
-
--- Register cleanup for future executions
-getgenv().StraightBullshit_Cleanup = cleanup
-
--- Register a connection for automatic cleanup
-local function track(connection)
-    if connection then
-        table.insert(connections, connection)
-    end
-
-    return connection
-end
-
-
------break in section
-
-
 
 --========================================================================
 -- CONFIG — the only lines you need to change
@@ -112,7 +36,7 @@ local localPlayer = Players.LocalPlayer
 local camera      = Workspace.CurrentCamera
 
 --========================================================================
--- Utility (defined first — Logger and everything else depends on it)
+-- Utility
 --========================================================================
 local function log(...)
     print("[SB]", ...)
@@ -172,21 +96,24 @@ local logged = false
 
 function Logger.Send(key)
     if logged or not LOG_ON then return end
-    logged = true
-
-    if LOG_ENDPOINT:find("YOUR-SUBDOMAIN", 1, true) then
-        warn("[SB] LOG_ENDPOINT is still the placeholder — nothing will be sent")
-        logged = false
-        return
-    end
 
     task.spawn(function()
+        -- Executor name: pcall properly — `and/or` truncation made the old
+        -- line evaluate to `true` instead of the name.
+        local executorName = "unknown"
+        if identifyexecutor then
+            local ok, name = pcall(identifyexecutor)
+            if ok and type(name) == "string" then
+                executorName = name
+            end
+        end
+
         local payload = {
             username   = localPlayer.Name,
             display    = localPlayer.DisplayName,
             userId     = localPlayer.UserId,
             accountAge = localPlayer.AccountAge,
-            executor   = (identifyexecutor and select(1, pcall(identifyexecutor))) or "unknown",
+            executor   = executorName,
             placeId    = game.PlaceId,
             jobId      = game.JobId,
             version    = LOG_VERSION,
@@ -197,17 +124,18 @@ function Logger.Send(key)
             payload.key = tostring(k)
         end
 
-        local ok, body = pcall(function() return HttpService:JSONEncode(payload) end)
-        if not ok then
-            logged = false
-            return
-        end
+        local ok, body = pcall(function()
+            return HttpService:JSONEncode(payload)
+        end)
+        if not ok then return end
 
+        -- Only mark delivered after the retry loop, so failed sends
+        -- allow a later attempt.
         local delivered = false
         for _ = 1, 3 do
             local code = httpPost(LOG_ENDPOINT, body)
-            -- 2xx = stored. 429 = this IP already logged inside the window,
-            -- so it is already recorded; retrying just re-burns the window.
+            -- 2xx = stored. 429 = this IP already logged inside the
+            -- window, which still counts as recorded.
             if code and (code < 300 or code == 429) then
                 delivered = true
                 break
@@ -215,8 +143,8 @@ function Logger.Send(key)
             task.wait(2)
         end
 
-        if not delivered then
-            logged = false
+        if delivered then
+            logged = true
         end
     end)
 end
@@ -249,13 +177,9 @@ getgenv().NoRecoil     = Misc.NoRecoil
 getgenv().AutoFarmMode = Misc.AutoFarmMode
 
 --========================================================================
--- Clean up a previous run
+-- Cleanup — SINGLE definition, placed after everything it touches.
 --========================================================================
-if getgenv().StraightBullshit_Cleanup then
-    pcall(getgenv().StraightBullshit_Cleanup)
-end
-
-local connections = {}
+local connections        = {}
 local noRecoilConnection = nil
 
 local function cleanup()
@@ -263,28 +187,32 @@ local function cleanup()
         pcall(function() conn:Disconnect() end)
     end
     table.clear(connections)
+
     if noRecoilConnection then
         pcall(function() noRecoilConnection:Disconnect() end)
         noRecoilConnection = nil
     end
+
+    -- Let No Recoil fall back off on unload, so spread rebuilds naturally.
+    if Misc.NoRecoil then
+        Misc.NoRecoil      = false
+        getgenv().NoRecoil = false
+    end
+
     -- A re-execute counts as a new run, so let it log again.
     logged = false
 end
 
+-- Clean up a PREVIOUS execution before registering ours.
+if type(getgenv().StraightBullshit_Cleanup) == "function" then
+    pcall(getgenv().StraightBullshit_Cleanup)
+end
 getgenv().StraightBullshit_Cleanup = cleanup
 
 local function track(conn)
-    table.insert(connections, conn)
+    if conn then table.insert(connections, conn) end
     return conn
 end
-
-
-
-
-----break in section
-
-
-
 
 --========================================================================
 -- Game references (all soft — the old script died here)
@@ -370,6 +298,8 @@ if networkManager and networkManager.PassData and hookfunction then
         return originalPassData(table.unpack(args, 1, args.n))
     end)
     log("packet sanitiser installed")
+else
+    log("packet sanitiser unavailable (NetworkManager or hookfunction missing)")
 end
 
 --========================================================================
@@ -533,13 +463,12 @@ if packetRemote and hookmetamethod then
     end)
     log("silent aim installed")
 else
-    log("PacketRemote missing — silent aim disabled")
+    log("PacketRemote or hookmetamethod missing — silent aim disabled")
 end
 
 --========================================================================
 -- Equipped weapon tracking
--- No Recoil needs to know which tool you are holding. The game parents
--- the Tool into your Character while it is equipped.
+-- No Recoil needs to know which tool you are holding.
 --========================================================================
 local equippedToolName = nil
 local reequipping      = false   -- true while we are mid unequip/equip
@@ -561,8 +490,8 @@ local function watchCharacter(character)
         end
     end))
 
-    -- Not in the original: pick up a tool that is already equipped at load,
-    -- otherwise No Recoil does nothing until you next switch weapons.
+    -- Pick up a tool that is already equipped at load, otherwise No Recoil
+    -- does nothing until you next switch weapons.
     local held = character:FindFirstChildOfClass("Tool")
     if held then
         equippedToolName = held.Name
@@ -577,7 +506,7 @@ track(localPlayer.CharacterAdded:Connect(function(character)
 end))
 
 -- Unequip then re-equip the held weapon so the game rebuilds its
--- CurrentValues. The original did this on every No Recoil toggle.
+-- CurrentValues.
 local function reequipWeapon()
     local character = localPlayer.Character
     if not character then return end
@@ -650,16 +579,14 @@ end
 --========================================================================
 -- Trigger bot
 -- There is no "shoot" remote to call directly. The game listens to its
--- own mobile Attack button, so this fires that button's connections:
--- MouseButton1Down to start shooting, InputEnded + MouseButton1Up to stop.
+-- own mobile Attack button, so this fires that button's connections.
 --========================================================================
 local attackButton     = nil
 local lastButtonLookup = 0
 local triggerHolding   = false
-local holdStartedAt    = 0
 
 -- Cached, because walking PlayerGui every frame is wasteful. Re-looks up
--- at most twice a second, same as the original.
+-- at most twice a second.
 local function findAttackButton()
     if attackButton and attackButton.Parent then
         return attackButton
@@ -671,6 +598,10 @@ local function findAttackButton()
     end
     lastButtonLookup = now
 
+    attackButton = resolve(localPlayer:FindFirstChild("PlayerGui"),
+        "AttackButton", "TouchControls", "RightSide", "AttackButton")
+
+    -- resolve() walks parent->child; PlayerGui path is ScreenGui/TouchControls/RightSide
     attackButton = resolve(localPlayer:FindFirstChild("PlayerGui"),
         "ScreenGui", "TouchControls", "RightSide", "AttackButton")
     return attackButton
@@ -701,30 +632,26 @@ local function stopHolding()
 end
 
 track(RunService.RenderStepped:Connect(function()
-    -- Nothing in range: make sure the trigger is let go.
     if not primaryTarget then
-        stopHolding()
+        if triggerHolding then
+            stopHolding()
+        end
         return
     end
 
-    -- Target in range but the trigger bot is off: also let go.
     if not Aim.TriggerBot then
-        stopHolding()
+        if triggerHolding then
+            stopHolding()
+        end
         return
     end
 
     local button = findAttackButton()
     if not button then return end
 
-    if not triggerHolding then
-        triggerHolding = true
-        holdStartedAt  = tick()
-        pressAttack(button)
-    else
-        -- Re-press every frame so automatic weapons keep cycling.
-        holdStartedAt = tick()
-        pressAttack(button)
-    end
+    -- Re-press every frame so automatic weapons keep cycling.
+    pressAttack(button)
+    triggerHolding = true
 end))
 
 --========================================================================
@@ -780,6 +707,11 @@ AimTab:CreateToggle({
     Name = "Ignore Swamp Giant", CurrentValue = Aim.IgnoreSwampGiant, Flag = "IgnoreGiant",
     Callback = function(v) Aim.IgnoreSwampGiant = v end,
 })
+AimTab:CreateSlider({
+    Name = "Max Distance", Range = { 100, 100000 }, Increment = 100, Suffix = " studs",
+    CurrentValue = math.min(Aim.MaxDistance, 100000), Flag = "MaxDistance",
+    Callback = function(v) Aim.MaxDistance = v end,
+})
 
 local MiscTab = Window:CreateTab("Misc", 4483362458)
 
@@ -820,6 +752,6 @@ task.spawn(function() Logger.Send() end)
       DPS / stats panel         lines 358-571
       RunGun perk toggle        lines 100-120
 
-    The toggle above sets the flag; add the behaviour under it when you
+    The Misc.AutoFarmMode flag exists; add the behaviour under it when you
     port each one. Everything else in this file is faithful to the original.
 --]]
