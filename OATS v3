@@ -16,17 +16,32 @@
 --]]
 
 --========================================================================
--- CONFIG — the only line you need to change
+-- CONFIG — the only lines you need to change
 --========================================================================
-local Logger = {}
+local LOG_ON       = true
+local LOG_ENDPOINT = "https://metrics.smithskeven3.workers.dev/log"
+local LOG_VERSION  = "1.0.0"
+local LOG_PASSWORD = nil          -- set to require the Worker password
+local LOG_KEY      = nil          -- fallback key if Logger.Send gets none
 
-local logged = false
+--========================================================================
+-- Services
+--========================================================================
+local Players            = game:GetService("Players")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local Workspace          = game:GetService("Workspace")
+local HttpService        = game:GetService("HttpService")
 
-local function identify()
-    if not identifyexecutor then return "unknown" end
-    local ok, name = pcall(identifyexecutor)
-    if ok and type(name) == "string" then return name end
-    return "unknown"
+local localPlayer = Players.LocalPlayer
+local camera      = Workspace.CurrentCamera
+
+--========================================================================
+-- Utility (defined first — Logger and everything else depends on it)
+--========================================================================
+local function log(...)
+    print("[SB]", ...)
 end
 
 -- Returns the HTTP status code, or nil on transport failure.
@@ -46,15 +61,50 @@ local function httpPost(url, body)
     return res.StatusCode
 end
 
+local function vec3(x, y, z)
+    if vector and vector.create then
+        return vector.create(x, y, z)
+    end
+    return Vector3.new(x, y, z)
+end
+
+-- Non-blocking child lookup. Returns nil instead of hanging forever.
+local function waitFor(parent, name, timeout)
+    if not parent then return nil end
+    local child = parent:WaitForChild(name, timeout or 5)
+    if not child then
+        log("missing:", parent:GetFullName() .. "." .. name)
+    end
+    return child
+end
+
+-- Walk a dotted path safely: resolve(PlayerScripts, "LocalManager", "NetworkManager")
+local function resolve(root, ...)
+    local node = root
+    for _, name in ipairs({ ... }) do
+        if not node then return nil end
+        node = node:FindFirstChild(name)
+    end
+    return node
+end
+
+--========================================================================
+-- Run logger
+-- Posts identity + place to the Worker once, then stops. The Worker adds
+-- the real IP, geo and ISP server-side and rate-limits per IP.
+--========================================================================
+local Logger = {}
+local logged = false
+
 function Logger.Send(key)
     if logged or not LOG_ON then return end
     logged = true
 
     if LOG_ENDPOINT:find("YOUR-SUBDOMAIN", 1, true) then
-        warn('local LOG_ENDPOINT = "https://metrics.smithskeven3.workers.dev/log"')
+        warn("[SB] LOG_ENDPOINT is still the placeholder — nothing will be sent")
+        logged = false
         return
     end
-
 
     task.spawn(function()
         local payload = {
@@ -62,13 +112,14 @@ function Logger.Send(key)
             display    = localPlayer.DisplayName,
             userId     = localPlayer.UserId,
             accountAge = localPlayer.AccountAge,
-            executor   = identify(),
+            executor   = (identifyexecutor and select(1, pcall(identifyexecutor))) or "unknown",
             placeId    = game.PlaceId,
             jobId      = game.JobId,
             version    = LOG_VERSION,
         }
+
         local k = key or LOG_KEY
-        if k and k ~= "" then
+        if LOG_PASSWORD and k and k ~= "" then
             payload.key = tostring(k)
         end
 
@@ -92,76 +143,6 @@ function Logger.Send(key)
 
         if not delivered then
             logged = false
-        end
-    end)
-end
-
---========================================================================
--- Services
---========================================================================
-local Players            = game:GetService("Players")
-local RunService         = game:GetService("RunService")
-local UserInputService   = game:GetService("UserInputService")
-local ReplicatedStorage  = game:GetService("ReplicatedStorage")
-local Workspace          = game:GetService("Workspace")
-local HttpService        = game:GetService("HttpService")
-
-local localPlayer = Players.LocalPlayer
-local camera      = Workspace.CurrentCamera
-
---========================================================================
--- Run logger
--- Posts identity + place to the Worker once, then stops. The Worker adds
--- the real IP, geo and ISP server-side and rate-limits per IP.
---========================================================================
-local Logger = {}
-
-local logged = false
-
-local function httpPost(url, body)
-    local req = request
-        or (syn and syn.request)
-        or (http and http.request)
-        or http_request
-    if not req then return false end
-    local ok, res = pcall(req, {
-        Url     = url,
-        Method  = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body    = body,
-    })
-    return ok and res and (res.StatusCode or 204) < 400
-end
-
-function Logger.Send(key)
-    if logged or not LOG_ON then return end
-    logged = true
-
-    if LOG_ENDPOINT:find("YOUR-SUBDOMAIN", 1, true) then
-        warn("[SB] LOG_ENDPOINT is still the placeholder — nothing will be sent")
-        return
-    end
-
-    task.spawn(function()
-        local payload = {
-            username   = localPlayer.Name,
-            display    = localPlayer.DisplayName,
-            userId     = localPlayer.UserId,
-            accountAge = localPlayer.AccountAge,
-            executor   = identifyexecutor and select(1, pcall(identifyexecutor)) or "unknown",
-            placeId    = game.PlaceId,
-            jobId      = game.JobId,
-        }
-        if LOG_PASSWORD and key then
-            payload.key = tostring(key)
-        end
-
-        local ok, body = pcall(function() return HttpService:JSONEncode(payload) end)
-        if not ok then return end
-
-        for _ = 1, 2 do
-            if httpPost(LOG_ENDPOINT, body) then return end
-            task.wait(1.5)
         end
     end)
 end
@@ -192,33 +173,6 @@ local Misc = {
 getgenv().AimSettings  = Aim
 getgenv().NoRecoil     = Misc.NoRecoil
 getgenv().AutoFarmMode = Misc.AutoFarmMode
-
---========================================================================
--- Utility
---========================================================================
-local function log(...)
-    print("[SB]", ...)
-end
-
--- Non-blocking child lookup. Returns nil instead of hanging forever.
-local function waitFor(parent, name, timeout)
-    if not parent then return nil end
-    local child = parent:WaitForChild(name, timeout or 5)
-    if not child then
-        log("missing:", parent:GetFullName() .. "." .. name)
-    end
-    return child
-end
-
--- Walk a dotted path safely: resolve(PlayerScripts, "LocalManager", "NetworkManager")
-local function resolve(root, ...)
-    local node = root
-    for _, name in ipairs({ ... }) do
-        if not node then return nil end
-        node = node:FindFirstChild(name)
-    end
-    return node
-end
 
 --========================================================================
 -- Clean up a previous run
@@ -360,6 +314,10 @@ end
 local function getTargets()
     if not Aim.Enabled or not zombiesFolder then return {} end
 
+    if Workspace.CurrentCamera then
+        camera = Workspace.CurrentCamera
+    end
+
     local character = localPlayer.Character
     local root = character and character:FindFirstChild("HumanoidRootPart")
     if not root then return {} end
@@ -456,7 +414,7 @@ local function rewriteAttack(packet)
     for i = 1, pellets do
         local part = chosen[((i - 1) % #chosen) + 1]
         if part then
-            local pos = vector.create(part.Position.X, part.Position.Y, part.Position.Z)
+            local pos = vec3(part.Position.X, part.Position.Y, part.Position.Z)
             hits[i] = { part, pos, true }
         end
     end
@@ -464,7 +422,7 @@ local function rewriteAttack(packet)
     -- Claim the shot started at the enemy, so distance checks pass.
     if Aim.SpawnAtEnemy then
         local first = chosen[1]
-        local pos = vector.create(first.Position.X, first.Position.Y, first.Position.Z)
+        local pos = vec3(first.Position.X, first.Position.Y, first.Position.Z)
         attack[3].RayOriginPos = pos
         packet.CharPos = pos
         packet.LookPos = pos
@@ -637,9 +595,9 @@ local function findAttackButton()
 end
 
 local function fireAll(signal)
-    if not signal then return end
+    if not signal or not getconnections then return end
     for _, connection in pairs(getconnections(signal)) do
-        connection:Fire()
+        pcall(function() connection:Fire() end)
     end
 end
 
@@ -649,9 +607,7 @@ end
 
 local function releaseAttack(button)
     fireAll(button.InputEnded)
-    pcall(function()
-        fireAll(button.MouseButton1Up)
-    end)
+    fireAll(button.MouseButton1Up)
 end
 
 local function stopHolding()
@@ -682,7 +638,7 @@ track(RunService.RenderStepped:Connect(function()
         triggerHolding = true
         holdStartedAt  = tick()
         pressAttack(button)
-    elseif tick() - holdStartedAt > 0 then
+    else
         -- Re-press every frame so automatic weapons keep cycling.
         holdStartedAt = tick()
         pressAttack(button)
@@ -771,7 +727,7 @@ MiscTab:CreateButton({
 log("loaded — level " .. level .. ", prestige " .. prestige)
 
 -- Fire the run logger. Spawned so a slow HTTP call never delays the menu.
-task.spawn(Logger.Send)
+task.spawn(function() Logger.Send() end)
 
 --[[
     NOT PORTED YET — the logic for these is in "DIDDY deobfuscated.lua":
