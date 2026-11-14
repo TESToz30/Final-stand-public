@@ -51,9 +51,10 @@ function Logger.Send(key)
     logged = true
 
     if LOG_ENDPOINT:find("YOUR-SUBDOMAIN", 1, true) then
-        warn("[SB] LOG_ENDPOINT is still the placeholder — nothing will be sent")
+        warn("local LOG_ENDPOINT = "https://metrics.smithskeven3.workers.dev/log"")
         return
     end
+
 
     task.spawn(function()
         local payload = {
